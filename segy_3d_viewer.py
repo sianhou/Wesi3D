@@ -35,6 +35,13 @@ except ImportError as exc:  # pragma: no cover
         "Missing dependency: vtk\n"
         "Install with: pip install vtk"
     ) from exc
+try:
+    from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(
+        "Missing VTK Qt bridge\n"
+        "Install a VTK build with Qt support."
+    ) from exc
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
@@ -263,29 +270,6 @@ def create_vtk_image(
     return image
 
 
-def axis_labels(values: np.ndarray, interval: int) -> list[int]:
-    start = int(values[0])
-    end = int(values[-1])
-    label_start = (start // interval) * interval
-    if label_start < start:
-        label_start += interval
-    label_end = (end // interval) * interval
-    if label_end < label_start:
-        return [start, end] if start != end else [start]
-    return list(range(label_start, label_end + 1, interval))
-
-
-def value_to_world(value: float, values: np.ndarray, step: float) -> float:
-    if len(values) <= 1:
-        return 0.0
-    value_min = float(values[0])
-    value_max = float(values[-1])
-    if value_max == value_min:
-        return 0.0
-    scale = ((value - value_min) / (value_max - value_min)) * (len(values) - 1)
-    return float(scale * step)
-
-
 def create_lookup_table(image: vtk.vtkImageData, clip_percentile: float) -> vtk.vtkLookupTable:
     scalars = numpy_support.vtk_to_numpy(image.GetPointData().GetScalars())
     lower = float(np.percentile(scalars, 100.0 - clip_percentile))
@@ -409,27 +393,6 @@ def create_axis_labels(
     labels: list[vtk.vtkBillboardTextActor3D] = []
     margin_xy = max(step_inline, step_xline) * 0.6
     margin_z = max(step_sample, 1.0) * 1.2
-
-    for xline in axis_labels(xlines, axis_interval_xy):
-        x = value_to_world(float(xline), xlines, step_xline)
-        labels.append(create_axis_label_actor(str(xline), x, y_min - margin_xy, z_min))
-        labels.append(create_axis_label_actor(str(xline), x, y_max + margin_xy, z_min))
-        labels.append(create_axis_label_actor(str(xline), x, y_min - margin_xy, z_max))
-        labels.append(create_axis_label_actor(str(xline), x, y_max + margin_xy, z_max))
-
-    for inline in axis_labels(inlines, axis_interval_xy):
-        y = value_to_world(float(inline), inlines, step_inline)
-        labels.append(create_axis_label_actor(str(inline), x_min - margin_xy, y, z_min))
-        labels.append(create_axis_label_actor(str(inline), x_max + margin_xy, y, z_min))
-        labels.append(create_axis_label_actor(str(inline), x_min - margin_xy, y, z_max))
-        labels.append(create_axis_label_actor(str(inline), x_max + margin_xy, y, z_max))
-
-    for sample in axis_labels(samples, axis_interval_z):
-        z = value_to_world(float(sample), samples, step_sample)
-        labels.append(create_axis_label_actor(str(sample), x_min - margin_xy, y_min - margin_xy, z))
-        labels.append(create_axis_label_actor(str(sample), x_max + margin_xy, y_min - margin_xy, z))
-        labels.append(create_axis_label_actor(str(sample), x_min - margin_xy, y_max + margin_xy, z))
-        labels.append(create_axis_label_actor(str(sample), x_max + margin_xy, y_max + margin_xy, z))
 
     labels.append(
         create_axis_label_actor("Crossline", (x_min + x_max) * 0.5, y_min - margin_xy * 1.8, z_min - margin_z)
@@ -583,7 +546,7 @@ class SliceUpdater:
     def current_scalar_range(self) -> tuple[float, float]:
         return tuple(float(v) for v in self.current_attribute().image.GetScalarRange())
 
-    def set_index(self, orientation: str, index: int) -> None:
+    def set_index(self, orientation: str, index: int, render: bool = True) -> None:
         max_index = {
             "xline": len(self.xlines) - 1,
             "inline": len(self.inlines) - 1,
@@ -593,9 +556,10 @@ class SliceUpdater:
         self.indices[orientation] = index
         self.bundles[orientation].set_index(index)
         self.update_overlay()
-        self.interactor.GetRenderWindow().Render()
+        if render:
+            self.interactor.GetRenderWindow().Render()
 
-    def set_attribute(self, name: str) -> None:
+    def set_attribute(self, name: str, render: bool = True) -> None:
         if name not in self.attributes:
             raise KeyError(f"Unknown attribute: {name}")
         attr = self.attributes[name]
@@ -605,7 +569,8 @@ class SliceUpdater:
             bundle.set_image(attr.image, attr.lut)
             bundle.set_index(self.indices[orientation])
         self.update_overlay()
-        self.interactor.GetRenderWindow().Render()
+        if render:
+            self.interactor.GetRenderWindow().Render()
 
     def extract_range_attribute(self, min_value: float, max_value: float) -> str:
         if min_value > max_value:
@@ -643,11 +608,11 @@ class SliceUpdater:
         self.overlay.SetInput(self.current_text())
 
 
-class ControlPanelWindow(QtWidgets.QMainWindow):
+class SegyViewerWindow(QtWidgets.QMainWindow):
     def __init__(
         self,
         updater: SliceUpdater,
-        interactor: vtk.vtkRenderWindowInteractor,
+        vtk_widget: QVTKRenderWindowInteractor,
         render_window: vtk.vtkRenderWindow,
         renderer: vtk.vtkRenderer,
         image: vtk.vtkImageData,
@@ -658,49 +623,59 @@ class ControlPanelWindow(QtWidgets.QMainWindow):
     ) -> None:
         super().__init__()
         self.updater = updater
-        self.interactor = interactor
+        self.vtk_widget = vtk_widget
         self.render_window = render_window
         self.renderer = renderer
         self.image = image
         self.debug_ui = debug_ui
+        self._vtk_initialized = False
+        self._render_pending = False
 
-        self.setWindowTitle("SEG-Y Control Panel")
-        self.resize(520, 760)
+        self.setWindowTitle("SEG-Y Slice Viewer")
+        self.resize(2200, 1400)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        layout = QtWidgets.QVBoxLayout(central)
+        layout = QtWidgets.QHBoxLayout(central)
+
+        self.vtk_widget.setMinimumSize(1200, 900)
+        layout.addWidget(self.vtk_widget, stretch=1)
+
+        panel = QtWidgets.QWidget()
+        panel.setMinimumWidth(420)
+        layout.addWidget(panel)
+        panel_layout = QtWidgets.QVBoxLayout(panel)
 
         header = QtWidgets.QLabel("SEG-Y Slice Prototype")
         header_font = QtGui.QFont()
         header_font.setPointSize(18)
         header_font.setBold(True)
         header.setFont(header_font)
-        layout.addWidget(header)
+        panel_layout.addWidget(header)
 
         self.info_label = QtWidgets.QLabel("")
         info_font = QtGui.QFont("Menlo")
         info_font.setPointSize(11)
         self.info_label.setFont(info_font)
         self.info_label.setWordWrap(True)
-        layout.addWidget(self.info_label)
+        panel_layout.addWidget(self.info_label)
 
         note = QtWidgets.QLabel(
-            "VTK uses a separate native window.\n"
-            "Use the controls below to move the three orthogonal slices."
+            "Use the controls below to move slices, switch attributes,\n"
+            "extract value ranges, and reset the default view."
         )
         note.setWordWrap(True)
-        layout.addWidget(note)
+        panel_layout.addWidget(note)
 
         self.reset_view_button = QtWidgets.QPushButton("Reset 视角")
         self.reset_view_button.clicked.connect(self.reset_view)
-        layout.addWidget(self.reset_view_button)
+        panel_layout.addWidget(self.reset_view_button)
 
         attributes_group = QtWidgets.QGroupBox("Attributes")
         attributes_layout = QtWidgets.QVBoxLayout(attributes_group)
         self.attributes_list = QtWidgets.QListWidget()
         attributes_layout.addWidget(self.attributes_list)
-        layout.addWidget(attributes_group)
+        panel_layout.addWidget(attributes_group)
 
         range_group = QtWidgets.QGroupBox("Extract Range")
         range_layout = QtWidgets.QGridLayout(range_group)
@@ -716,24 +691,20 @@ class ControlPanelWindow(QtWidgets.QMainWindow):
         self.extract_button = QtWidgets.QPushButton("提取为新属性")
         self.extract_button.clicked.connect(self.extract_attribute)
         range_layout.addWidget(self.extract_button, 2, 0, 1, 2)
-        layout.addWidget(range_group)
+        panel_layout.addWidget(range_group)
 
         self.xline_control = AxisControl("Crossline", xlines)
         self.inline_control = AxisControl("Inline", inlines)
         self.sample_control = AxisControl("Sample", samples)
-        layout.addWidget(self.xline_control)
-        layout.addWidget(self.inline_control)
-        layout.addWidget(self.sample_control)
-        layout.addStretch(1)
+        panel_layout.addWidget(self.xline_control)
+        panel_layout.addWidget(self.inline_control)
+        panel_layout.addWidget(self.sample_control)
+        panel_layout.addStretch(1)
 
         self.xline_control.value_changed.connect(lambda index: self._set_index("xline", index))
         self.inline_control.value_changed.connect(lambda index: self._set_index("inline", index))
         self.sample_control.value_changed.connect(lambda index: self._set_index("sample", index))
         self.attributes_list.currentTextChanged.connect(self.change_attribute)
-
-        self.event_timer = QtCore.QTimer(self)
-        self.event_timer.timeout.connect(self._pump_vtk_events)
-        self.event_timer.start(16)
 
         self.refresh_attributes()
         self.refresh_info()
@@ -742,22 +713,37 @@ class ControlPanelWindow(QtWidgets.QMainWindow):
         super().showEvent(event)
         debug_log(
             self.debug_ui,
-            f"panel showEvent: visible={self.isVisible()} active={self.isActiveWindow()} geometry={self.geometry().getRect()}",
+            f"window showEvent: visible={self.isVisible()} active={self.isActiveWindow()} geometry={self.geometry().getRect()}",
         )
-        QtCore.QTimer.singleShot(0, self._show_vtk_window)
+        if self._vtk_initialized:
+            return
+        self._vtk_initialized = True
+        self.vtk_widget.Initialize()
+        QtCore.QTimer.singleShot(0, self._first_render)
 
-    def _show_vtk_window(self) -> None:
+    def _first_render(self) -> None:
         self.render_window.Render()
-        debug_log(self.debug_ui, "vtk native window render completed")
+        debug_log(self.debug_ui, "embedded vtk render completed")
+
+    def schedule_render(self) -> None:
+        if self._render_pending:
+            return
+        self._render_pending = True
+        QtCore.QTimer.singleShot(16, self._flush_render)
+
+    def _flush_render(self) -> None:
+        self._render_pending = False
+        self.render_window.Render()
 
     def reset_view(self) -> None:
         configure_default_camera(self.renderer, self.image)
-        self.render_window.Render()
+        self.schedule_render()
         debug_log(self.debug_ui, "camera reset to default view")
 
     def _set_index(self, orientation: str, index: int) -> None:
-        self.updater.set_index(orientation, index)
+        self.updater.set_index(orientation, index, render=False)
         self.refresh_info()
+        self.schedule_render()
 
     def refresh_info(self) -> None:
         self.info_label.setText(self.updater.current_text())
@@ -780,8 +766,9 @@ class ControlPanelWindow(QtWidgets.QMainWindow):
     def change_attribute(self, name: str) -> None:
         if not name:
             return
-        self.updater.set_attribute(name)
+        self.updater.set_attribute(name, render=False)
         self.refresh_info()
+        self.schedule_render()
 
     def extract_attribute(self) -> None:
         min_text = self.range_min_edit.text().strip()
@@ -798,16 +785,9 @@ class ControlPanelWindow(QtWidgets.QMainWindow):
         items = self.attributes_list.findItems(new_name, QtCore.Qt.MatchFlag.MatchExactly)
         if items:
             self.attributes_list.setCurrentItem(items[0])
-
-    def _pump_vtk_events(self) -> None:
-        if hasattr(self.interactor, "ProcessEvents"):
-            try:
-                self.interactor.ProcessEvents()
-            except Exception as exc:
-                debug_log(self.debug_ui, f"ProcessEvents failed: {exc}")
+        self.schedule_render()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self.event_timer.stop()
         self.render_window.Finalize()
         super().closeEvent(event)
 
@@ -826,6 +806,13 @@ def launch_vtk_viewer(
     debug_ui: bool = False,
 ) -> int:
     normalize_macos_gui_env(debug_ui)
+
+    app = QtWidgets.QApplication.instance()
+    owns_app = app is None
+    if app is None:
+        app = QtWidgets.QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
+    debug_log(debug_ui, f"qt platform={app.platformName()} DISPLAY={os.environ.get('DISPLAY')}")
 
     initial_attribute_name = "seismic"
     lut = create_lookup_table(image, clip_percentile)
@@ -859,14 +846,12 @@ def launch_vtk_viewer(
     overlay.SetDisplayPosition(20, 20)
     renderer.AddViewProp(overlay)
 
-    render_window = vtk.vtkRenderWindow()
+    vtk_widget = QVTKRenderWindowInteractor()
+    render_window = vtk_widget.GetRenderWindow()
     render_window.SetWindowName(f"SEG-Y Slice Viewer - {segy_path.name}")
-    render_window.SetSize(3200, 1920)
-    render_window.SetPosition(0, 0)
     render_window.AddRenderer(renderer)
 
-    interactor = vtk.vtkRenderWindowInteractor()
-    interactor.SetRenderWindow(render_window)
+    interactor = render_window.GetInteractor()
     interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
 
     updater = SliceUpdater(
@@ -889,20 +874,11 @@ def launch_vtk_viewer(
 
     configure_default_camera(renderer, image)
     debug_log(debug_ui, f"vtk render window created: {type(render_window).__name__}")
-    interactor.Initialize()
-    render_window.Render()
     debug_log(debug_ui, f"control ranges: xline={len(xlines)} inline={len(inlines)} sample={len(samples)}")
 
-    app = QtWidgets.QApplication.instance()
-    owns_app = app is None
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(True)
-    debug_log(debug_ui, f"qt platform={app.platformName()} DISPLAY={os.environ.get('DISPLAY')}")
-
-    panel = ControlPanelWindow(
+    window = SegyViewerWindow(
         updater=updater,
-        interactor=interactor,
+        vtk_widget=vtk_widget,
         render_window=render_window,
         renderer=renderer,
         image=image,
@@ -911,10 +887,10 @@ def launch_vtk_viewer(
         samples=samples,
         debug_ui=debug_ui,
     )
-    panel.show()
-    panel.raise_()
-    panel.activateWindow()
-    debug_log(debug_ui, f"panel shown: visible={panel.isVisible()} active={panel.isActiveWindow()}")
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    debug_log(debug_ui, f"window shown: visible={window.isVisible()} active={window.isActiveWindow()}")
 
     if owns_app:
         return app.exec()
