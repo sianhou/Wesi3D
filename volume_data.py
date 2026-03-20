@@ -19,13 +19,231 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
 
+try:
+    import segyio
+except ImportError:
+    segyio = None
+
+INLINE_FIELD = 189
+XLINE_FIELD = 193
+
 AxisName = Literal["xline", "inline", "sample"]
+
+
+@dataclass(frozen=True)
+class SegyGeometry:
+    inlines: np.ndarray
+    xlines: np.ndarray
+    sample_axis: np.ndarray
+    trace_index_grid: np.ndarray
+
+
+@dataclass(frozen=True)
+class VolumeData:
+    """
+    In-memory seismic cube with explicit physical axes.
+
+    Shape convention:
+        data[xline_index, inline_index, sample_index]
+    """
+
+    data: np.ndarray
+    xlines: np.ndarray
+    inlines: np.ndarray
+    samples: np.ndarray
+    name: str = "volume"
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        data = np.asarray(self.data, dtype=np.float32)
+        xlines = np.asarray(self.xlines)
+        inlines = np.asarray(self.inlines)
+        samples = np.asarray(self.samples)
+        if data.ndim != 3:
+            raise ValueError("volume data must be 3D")
+        expected_shape = (len(xlines), len(inlines), len(samples))
+        if data.shape != expected_shape:
+            raise ValueError(
+                f"volume shape {data.shape} does not match axes {expected_shape}"
+            )
+        object.__setattr__(self, "data", data)
+        object.__setattr__(self, "xlines", xlines)
+        object.__setattr__(self, "inlines", inlines)
+        object.__setattr__(self, "samples", samples)
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return tuple(int(v) for v in self.data.shape)
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self.data.dtype
+
+    def axis_values(self, axis: AxisName) -> np.ndarray:
+        if axis == "xline":
+            return self.xlines
+        if axis == "inline":
+            return self.inlines
+        return self.samples
+
+    def renamed(self, name: str) -> "VolumeData":
+        return VolumeData(
+            data=self.data,
+            xlines=self.xlines,
+            inlines=self.inlines,
+            samples=self.samples,
+            name=name,
+            metadata=self.metadata,
+        )
+
+    def with_data(
+        self,
+        data: np.ndarray,
+        *,
+        name: str | None = None,
+        xlines: np.ndarray | None = None,
+        inlines: np.ndarray | None = None,
+        samples: np.ndarray | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> "VolumeData":
+        return VolumeData(
+            data=data,
+            xlines=self.xlines if xlines is None else xlines,
+            inlines=self.inlines if inlines is None else inlines,
+            samples=self.samples if samples is None else samples,
+            name=self.name if name is None else name,
+            metadata=self.metadata if metadata is None else metadata,
+        )
+
+
+def _require_segyio() -> None:
+    if segyio is None:
+        raise RuntimeError("Missing dependency: segyio")
+
+
+def validate_interval(name: str, value: int) -> int:
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def detect_regular_grid(iline_vals: np.ndarray, xline_vals: np.ndarray) -> np.ndarray:
+    unique_ilines = np.unique(iline_vals)
+    unique_xlines = np.unique(xline_vals)
+    ni = len(unique_ilines)
+    nx = len(unique_xlines)
+    ntraces = len(iline_vals)
+
+    if ni * nx != ntraces:
+        raise ValueError(
+            "Trace geometry is not a full regular inline/xline grid. "
+            f"unique_ilines={ni}, unique_xlines={nx}, traces={ntraces}"
+        )
+
+    sort_idx = np.lexsort((xline_vals, iline_vals))
+    sorted_ilines = iline_vals[sort_idx].reshape(ni, nx)
+    sorted_xlines = xline_vals[sort_idx].reshape(ni, nx)
+
+    if not np.array_equal(sorted_ilines[:, 0], unique_ilines):
+        raise ValueError("Inline headers do not form a consistent regular grid.")
+    if not np.array_equal(sorted_xlines[0, :], unique_xlines):
+        raise ValueError("Crossline headers do not form a consistent regular grid.")
+
+    return sort_idx.reshape(ni, nx)
+
+
+def load_segy_geometry(
+    segy_path: str | Path,
+    inline_field: int = INLINE_FIELD,
+    xline_field: int = XLINE_FIELD,
+) -> SegyGeometry:
+    _require_segyio()
+    segy_path = Path(segy_path)
+    with segyio.open(str(segy_path), "r", strict=False, ignore_geometry=True) as segy:
+        iline_vals = np.asarray(segy.attributes(inline_field)[:], dtype=np.int64)
+        xline_vals = np.asarray(segy.attributes(xline_field)[:], dtype=np.int64)
+        sample_axis = np.asarray(segy.samples, dtype=np.float32)
+
+    return SegyGeometry(
+        inlines=np.unique(iline_vals),
+        xlines=np.unique(xline_vals),
+        sample_axis=sample_axis,
+        trace_index_grid=detect_regular_grid(iline_vals, xline_vals),
+    )
+
+
+def read_segy_volume(
+    segy_path: str | Path,
+    *,
+    geometry: SegyGeometry | None = None,
+    interval_inline: int = 1,
+    interval_xline: int = 1,
+    interval_sample: int = 1,
+    inline_field: int = INLINE_FIELD,
+    xline_field: int = XLINE_FIELD,
+    dtype: np.dtype | str = np.float32,
+    name: str | None = None,
+) -> VolumeData:
+    _require_segyio()
+    segy_path = Path(segy_path)
+    geometry = geometry or load_segy_geometry(
+        segy_path,
+        inline_field=inline_field,
+        xline_field=xline_field,
+    )
+
+    il_idx = np.arange(
+        0,
+        len(geometry.inlines),
+        validate_interval("interval_inline", interval_inline),
+        dtype=np.int64,
+    )
+    xl_idx = np.arange(
+        0,
+        len(geometry.xlines),
+        validate_interval("interval_xline", interval_xline),
+        dtype=np.int64,
+    )
+    z_idx = np.arange(
+        0,
+        len(geometry.sample_axis),
+        validate_interval("interval_sample", interval_sample),
+        dtype=np.int64,
+    )
+
+    volume = np.empty(
+        (len(xl_idx), len(il_idx), len(z_idx)),
+        dtype=np.dtype(dtype),
+        order="F",
+    )
+
+    with segyio.open(str(segy_path), "r", strict=False, ignore_geometry=True) as segy:
+        for out_y, il_pos in enumerate(il_idx):
+            trace_indices = geometry.trace_index_grid[il_pos, xl_idx]
+            for out_x, trace_idx in enumerate(trace_indices):
+                trace = np.asarray(segy.trace[int(trace_idx)], dtype=np.float32)
+                volume[out_x, out_y, :] = trace[z_idx]
+
+    return VolumeData(
+        data=volume,
+        xlines=geometry.xlines[xl_idx],
+        inlines=geometry.inlines[il_idx],
+        samples=geometry.sample_axis[z_idx],
+        name=segy_path.stem if name is None else name,
+        metadata={
+            "source_path": str(segy_path),
+            "interval_inline": int(interval_inline),
+            "interval_xline": int(interval_xline),
+            "interval_sample": int(interval_sample),
+        },
+    )
 
 
 @dataclass(frozen=True)
