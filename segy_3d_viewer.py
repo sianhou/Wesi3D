@@ -56,6 +56,13 @@ class SegyGeometry:
     trace_index_grid: np.ndarray
 
 
+@dataclass
+class AttributeVolume:
+    name: str
+    image: vtk.vtkImageData
+    lut: vtk.vtkLookupTable
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SEG-Y slice viewer")
     parser.add_argument(
@@ -309,41 +316,6 @@ def create_lookup_table(image: vtk.vtkImageData, clip_percentile: float) -> vtk.
     return lut
 
 
-def create_slice_actor(
-    image: vtk.vtkImageData,
-    orientation: str,
-    slice_index: int,
-    lut: vtk.vtkLookupTable,
-    opacity: float,
-) -> vtk.vtkImageActor:
-    mapper = vtk.vtkImageMapToColors()
-    mapper.SetInputData(image)
-    mapper.SetLookupTable(lut)
-    mapper.Update()
-
-    actor = vtk.vtkImageActor()
-    actor.GetMapper().SetInputConnection(mapper.GetOutputPort())
-    actor.InterpolateOn()
-
-    extent = list(image.GetExtent())
-    if orientation == "xline":
-        extent[0] = slice_index
-        extent[1] = slice_index
-    elif orientation == "inline":
-        extent[2] = slice_index
-        extent[3] = slice_index
-    elif orientation == "sample":
-        extent[4] = slice_index
-        extent[5] = slice_index
-    else:
-        raise ValueError(f"Unknown slice orientation: {orientation}")
-
-    actor.SetDisplayExtent(*extent)
-    actor.ForceOpaqueOff()
-    actor.SetOpacity(opacity)
-    return actor
-
-
 def set_slice_index(actor: vtk.vtkImageActor, image: vtk.vtkImageData, orientation: str, slice_index: int) -> None:
     extent = list(image.GetExtent())
     if orientation == "xline":
@@ -358,6 +330,42 @@ def set_slice_index(actor: vtk.vtkImageActor, image: vtk.vtkImageData, orientati
     else:
         raise ValueError(f"Unknown slice orientation: {orientation}")
     actor.SetDisplayExtent(*extent)
+
+
+class SliceActorBundle:
+    def __init__(
+        self,
+        orientation: str,
+        image: vtk.vtkImageData,
+        slice_index: int,
+        lut: vtk.vtkLookupTable,
+        opacity: float,
+    ) -> None:
+        self.orientation = orientation
+        self.image = image
+        self.mapper = vtk.vtkImageMapToColors()
+        self.mapper.SetInputData(image)
+        self.mapper.SetLookupTable(lut)
+        self.mapper.Update()
+
+        self.actor = vtk.vtkImageActor()
+        self.actor.GetMapper().SetInputConnection(self.mapper.GetOutputPort())
+        self.actor.InterpolateOn()
+        self.actor.ForceOpaqueOff()
+        self.actor.SetOpacity(opacity)
+        self.slice_index = 0
+        self.set_index(slice_index)
+
+    def set_image(self, image: vtk.vtkImageData, lut: vtk.vtkLookupTable) -> None:
+        self.image = image
+        self.mapper.SetInputData(image)
+        self.mapper.SetLookupTable(lut)
+        self.mapper.Update()
+        self.set_index(self.slice_index)
+
+    def set_index(self, slice_index: int) -> None:
+        self.slice_index = int(slice_index)
+        set_slice_index(self.actor, self.image, self.orientation, self.slice_index)
 
 
 def create_outline(image: vtk.vtkImageData) -> vtk.vtkActor:
@@ -441,6 +449,27 @@ def format_value(value: float) -> str:
     return f"{float(value):.3f}"
 
 
+def configure_default_camera(renderer: vtk.vtkRenderer, image: vtk.vtkImageData) -> None:
+    x_min, x_max, y_min, y_max, z_min, z_max = image.GetBounds()
+    center = (
+        (x_min + x_max) * 0.5,
+        (y_min + y_max) * 0.5,
+        (z_min + z_max) * 0.5,
+    )
+    span_x = x_max - x_min
+    span_y = y_max - y_min
+    span_z = z_max - z_min
+    distance = max(span_x, span_y, span_z) * 2.2
+
+    camera = renderer.GetActiveCamera()
+    camera.SetFocalPoint(*center)
+    camera.SetPosition(center[0] + distance, center[1] + distance, center[2])
+    camera.SetViewUp(0.0, 0.0, -1.0)
+    renderer.ResetCameraClippingRange()
+    camera.Dolly(2.0)
+    renderer.ResetCameraClippingRange()
+
+
 class AxisControl(QtWidgets.QGroupBox):
     value_changed = QtCore.Signal(int)
 
@@ -502,35 +531,57 @@ class SliceUpdater:
         self,
         interactor: vtk.vtkRenderWindowInteractor,
         image: vtk.vtkImageData,
-        actors: dict[str, vtk.vtkImageActor],
+        bundles: dict[str, SliceActorBundle],
         overlay: vtk.vtkTextActor,
         xlines: np.ndarray,
         inlines: np.ndarray,
         samples: np.ndarray,
         segy_path: Path,
+        initial_attribute_name: str,
+        initial_lut: vtk.vtkLookupTable,
+        opacity: float,
     ) -> None:
         self.interactor = interactor
         self.image = image
-        self.actors = actors
+        self.bundles = bundles
         self.overlay = overlay
         self.xlines = xlines
         self.inlines = inlines
         self.samples = samples
         self.segy_path = segy_path
+        self.opacity = opacity
         self.indices = {
             "xline": len(xlines) // 2,
             "inline": len(inlines) // 2,
             "sample": len(samples) // 2,
         }
+        self.attributes: dict[str, AttributeVolume] = {
+            initial_attribute_name: AttributeVolume(
+                name=initial_attribute_name,
+                image=image,
+                lut=initial_lut,
+            )
+        }
+        self.current_attribute_name = initial_attribute_name
         self.update_overlay()
 
     def current_text(self) -> str:
         return (
             f"{self.segy_path.name}\n"
+            f"Attribute: {self.current_attribute_name}\n"
             f"Crossline: {format_value(self.xlines[self.indices['xline']])}\n"
             f"Inline: {format_value(self.inlines[self.indices['inline']])}\n"
             f"Sample: {format_value(self.samples[self.indices['sample']])}"
         )
+
+    def attribute_names(self) -> list[str]:
+        return list(self.attributes.keys())
+
+    def current_attribute(self) -> AttributeVolume:
+        return self.attributes[self.current_attribute_name]
+
+    def current_scalar_range(self) -> tuple[float, float]:
+        return tuple(float(v) for v in self.current_attribute().image.GetScalarRange())
 
     def set_index(self, orientation: str, index: int) -> None:
         max_index = {
@@ -540,9 +591,53 @@ class SliceUpdater:
         }[orientation]
         index = max(0, min(index, max_index))
         self.indices[orientation] = index
-        set_slice_index(self.actors[orientation], self.image, orientation, index)
+        self.bundles[orientation].set_index(index)
         self.update_overlay()
         self.interactor.GetRenderWindow().Render()
+
+    def set_attribute(self, name: str) -> None:
+        if name not in self.attributes:
+            raise KeyError(f"Unknown attribute: {name}")
+        attr = self.attributes[name]
+        self.current_attribute_name = name
+        self.image = attr.image
+        for orientation, bundle in self.bundles.items():
+            bundle.set_image(attr.image, attr.lut)
+            bundle.set_index(self.indices[orientation])
+        self.update_overlay()
+        self.interactor.GetRenderWindow().Render()
+
+    def extract_range_attribute(self, min_value: float, max_value: float) -> str:
+        if min_value > max_value:
+            min_value, max_value = max_value, min_value
+
+        source = self.current_attribute()
+        threshold = vtk.vtkImageThreshold()
+        threshold.SetInputData(source.image)
+        threshold.ThresholdBetween(min_value, max_value)
+        threshold.ReplaceInOff()
+        threshold.ReplaceOutOn()
+        threshold.SetOutValue(0.0)
+        threshold.SetOutputScalarTypeToFloat()
+        threshold.Update()
+
+        output = vtk.vtkImageData()
+        output.DeepCopy(threshold.GetOutput())
+        lut = create_lookup_table(output, 99.0)
+
+        base_name = f"{source.name}_range_{format_value(min_value)}_{format_value(max_value)}"
+        new_name = base_name
+        suffix = 1
+        while new_name in self.attributes:
+            suffix += 1
+            new_name = f"{base_name}_{suffix}"
+
+        self.attributes[new_name] = AttributeVolume(
+            name=new_name,
+            image=output,
+            lut=lut,
+        )
+        return new_name
 
     def update_overlay(self) -> None:
         self.overlay.SetInput(self.current_text())
@@ -554,6 +649,8 @@ class ControlPanelWindow(QtWidgets.QMainWindow):
         updater: SliceUpdater,
         interactor: vtk.vtkRenderWindowInteractor,
         render_window: vtk.vtkRenderWindow,
+        renderer: vtk.vtkRenderer,
+        image: vtk.vtkImageData,
         xlines: np.ndarray,
         inlines: np.ndarray,
         samples: np.ndarray,
@@ -563,6 +660,8 @@ class ControlPanelWindow(QtWidgets.QMainWindow):
         self.updater = updater
         self.interactor = interactor
         self.render_window = render_window
+        self.renderer = renderer
+        self.image = image
         self.debug_ui = debug_ui
 
         self.setWindowTitle("SEG-Y Control Panel")
@@ -593,6 +692,32 @@ class ControlPanelWindow(QtWidgets.QMainWindow):
         note.setWordWrap(True)
         layout.addWidget(note)
 
+        self.reset_view_button = QtWidgets.QPushButton("Reset 视角")
+        self.reset_view_button.clicked.connect(self.reset_view)
+        layout.addWidget(self.reset_view_button)
+
+        attributes_group = QtWidgets.QGroupBox("Attributes")
+        attributes_layout = QtWidgets.QVBoxLayout(attributes_group)
+        self.attributes_list = QtWidgets.QListWidget()
+        attributes_layout.addWidget(self.attributes_list)
+        layout.addWidget(attributes_group)
+
+        range_group = QtWidgets.QGroupBox("Extract Range")
+        range_layout = QtWidgets.QGridLayout(range_group)
+        range_layout.addWidget(QtWidgets.QLabel("Min"), 0, 0)
+        range_layout.addWidget(QtWidgets.QLabel("Max"), 1, 0)
+        self.range_min_edit = QtWidgets.QLineEdit()
+        self.range_max_edit = QtWidgets.QLineEdit()
+        validator = QtGui.QDoubleValidator()
+        self.range_min_edit.setValidator(validator)
+        self.range_max_edit.setValidator(validator)
+        range_layout.addWidget(self.range_min_edit, 0, 1)
+        range_layout.addWidget(self.range_max_edit, 1, 1)
+        self.extract_button = QtWidgets.QPushButton("提取为新属性")
+        self.extract_button.clicked.connect(self.extract_attribute)
+        range_layout.addWidget(self.extract_button, 2, 0, 1, 2)
+        layout.addWidget(range_group)
+
         self.xline_control = AxisControl("Crossline", xlines)
         self.inline_control = AxisControl("Inline", inlines)
         self.sample_control = AxisControl("Sample", samples)
@@ -604,11 +729,13 @@ class ControlPanelWindow(QtWidgets.QMainWindow):
         self.xline_control.value_changed.connect(lambda index: self._set_index("xline", index))
         self.inline_control.value_changed.connect(lambda index: self._set_index("inline", index))
         self.sample_control.value_changed.connect(lambda index: self._set_index("sample", index))
+        self.attributes_list.currentTextChanged.connect(self.change_attribute)
 
         self.event_timer = QtCore.QTimer(self)
         self.event_timer.timeout.connect(self._pump_vtk_events)
         self.event_timer.start(16)
 
+        self.refresh_attributes()
         self.refresh_info()
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
@@ -623,12 +750,54 @@ class ControlPanelWindow(QtWidgets.QMainWindow):
         self.render_window.Render()
         debug_log(self.debug_ui, "vtk native window render completed")
 
+    def reset_view(self) -> None:
+        configure_default_camera(self.renderer, self.image)
+        self.render_window.Render()
+        debug_log(self.debug_ui, "camera reset to default view")
+
     def _set_index(self, orientation: str, index: int) -> None:
         self.updater.set_index(orientation, index)
         self.refresh_info()
 
     def refresh_info(self) -> None:
         self.info_label.setText(self.updater.current_text())
+        min_value, max_value = self.updater.current_scalar_range()
+        if not self.range_min_edit.hasFocus():
+            self.range_min_edit.setText(format_value(min_value))
+        if not self.range_max_edit.hasFocus():
+            self.range_max_edit.setText(format_value(max_value))
+
+    def refresh_attributes(self) -> None:
+        selected = self.updater.current_attribute_name
+        self.attributes_list.blockSignals(True)
+        self.attributes_list.clear()
+        self.attributes_list.addItems(self.updater.attribute_names())
+        items = self.attributes_list.findItems(selected, QtCore.Qt.MatchFlag.MatchExactly)
+        if items:
+            self.attributes_list.setCurrentItem(items[0])
+        self.attributes_list.blockSignals(False)
+
+    def change_attribute(self, name: str) -> None:
+        if not name:
+            return
+        self.updater.set_attribute(name)
+        self.refresh_info()
+
+    def extract_attribute(self) -> None:
+        min_text = self.range_min_edit.text().strip()
+        max_text = self.range_max_edit.text().strip()
+        if not min_text or not max_text:
+            return
+        try:
+            min_value = float(min_text)
+            max_value = float(max_text)
+        except ValueError:
+            return
+        new_name = self.updater.extract_range_attribute(min_value, max_value)
+        self.refresh_attributes()
+        items = self.attributes_list.findItems(new_name, QtCore.Qt.MatchFlag.MatchExactly)
+        if items:
+            self.attributes_list.setCurrentItem(items[0])
 
     def _pump_vtk_events(self) -> None:
         if hasattr(self.interactor, "ProcessEvents"):
@@ -658,11 +827,12 @@ def launch_vtk_viewer(
 ) -> int:
     normalize_macos_gui_env(debug_ui)
 
+    initial_attribute_name = "seismic"
     lut = create_lookup_table(image, clip_percentile)
     dims = image.GetDimensions()
-    xline_actor = create_slice_actor(image, "xline", dims[0] // 2, lut, opacity_scale)
-    inline_actor = create_slice_actor(image, "inline", dims[1] // 2, lut, opacity_scale)
-    sample_actor = create_slice_actor(image, "sample", dims[2] // 2, lut, opacity_scale)
+    xline_bundle = SliceActorBundle("xline", image, dims[0] // 2, lut, opacity_scale)
+    inline_bundle = SliceActorBundle("inline", image, dims[1] // 2, lut, opacity_scale)
+    sample_bundle = SliceActorBundle("sample", image, dims[2] // 2, lut, opacity_scale)
     outline_actor = create_outline(image)
     axis_texts = create_axis_labels(
         image,
@@ -676,9 +846,9 @@ def launch_vtk_viewer(
 
     renderer = vtk.vtkRenderer()
     renderer.SetBackground(0.08, 0.10, 0.14)
-    renderer.AddActor(xline_actor)
-    renderer.AddActor(inline_actor)
-    renderer.AddActor(sample_actor)
+    renderer.AddActor(xline_bundle.actor)
+    renderer.AddActor(inline_bundle.actor)
+    renderer.AddActor(sample_bundle.actor)
     renderer.AddActor(outline_actor)
     for actor in axis_texts:
         renderer.AddActor(actor)
@@ -691,7 +861,8 @@ def launch_vtk_viewer(
 
     render_window = vtk.vtkRenderWindow()
     render_window.SetWindowName(f"SEG-Y Slice Viewer - {segy_path.name}")
-    render_window.SetSize(1600, 960)
+    render_window.SetSize(3200, 1920)
+    render_window.SetPosition(0, 0)
     render_window.AddRenderer(renderer)
 
     interactor = vtk.vtkRenderWindowInteractor()
@@ -701,19 +872,22 @@ def launch_vtk_viewer(
     updater = SliceUpdater(
         interactor=interactor,
         image=image,
-        actors={
-            "xline": xline_actor,
-            "inline": inline_actor,
-            "sample": sample_actor,
+        bundles={
+            "xline": xline_bundle,
+            "inline": inline_bundle,
+            "sample": sample_bundle,
         },
         overlay=overlay,
         xlines=xlines,
         inlines=inlines,
         samples=samples,
         segy_path=segy_path,
+        initial_attribute_name=initial_attribute_name,
+        initial_lut=lut,
+        opacity=opacity_scale,
     )
 
-    renderer.ResetCamera()
+    configure_default_camera(renderer, image)
     debug_log(debug_ui, f"vtk render window created: {type(render_window).__name__}")
     interactor.Initialize()
     render_window.Render()
@@ -730,6 +904,8 @@ def launch_vtk_viewer(
         updater=updater,
         interactor=interactor,
         render_window=render_window,
+        renderer=renderer,
+        image=image,
         xlines=xlines,
         inlines=inlines,
         samples=samples,
