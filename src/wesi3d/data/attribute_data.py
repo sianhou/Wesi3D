@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from volume_data import VolumeData
+from .volume_data import VolumeData
 
 try:
     import vtk

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from volume_data import VolumeData
+from ..data.volume_data import VolumeData
 
 _NEIGHBOR_OFFSETS_6 = (
     (-1, 0, 0),

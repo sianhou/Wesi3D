@@ -24,14 +24,13 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
+from ..utils.constants import INLINE_FIELD, XLINE_FIELD
 
 try:
     import segyio
 except ImportError:
     segyio = None
 
-INLINE_FIELD = 189
-XLINE_FIELD = 193
 
 AxisName = Literal["xline", "inline", "sample"]
 

@@ -1,0 +1,3 @@
+"""
+Wesi3D package.
+"""

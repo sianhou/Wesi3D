@@ -3,7 +3,7 @@
 3D SEG-Y viewer for a velocity cube.
 
 Default behavior:
-- open ./vel.sgy
+- open data/raw/vel.sgy
 - read inline / crossline from trace header bytes 189 / 193
 - downsample a large cube to a manageable volume
 - display three orthogonal slices with VTK
@@ -43,20 +43,23 @@ except ImportError as exc:  # pragma: no cover
         "Install with: pip install PySide6"
     ) from exc
 
-from attribute_data import (
+from ..config import DEFAULT_VIEWER_CONFIG
+from ..data.attribute_data import (
     AttributeVolume,
     RenderSpacing,
     create_lookup_table_from_scalars,
     load_attribute_from_volume,
 )
-from control_points import (
+from ..data.volume_data import load_segy_geometry, read_segy_volume
+from ..processing.control_points import (
     ControlPoint,
     apply_master_point_z_move,
     extract_control_points,
     master_control_points,
 )
-from volume_data import load_segy_geometry, read_segy_volume
-from volume_processing import extract_connected_components, extract_range_volume
+from ..processing.volume_processing import extract_connected_components, extract_range_volume
+from ..utils.constants import APP_NAME
+from ..utils.formatting import format_value
 
 
 @dataclass
@@ -99,8 +102,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "segy_path",
         nargs="?",
-        default="vel.sgy",
-        help="Path to SEG-Y file. Defaults to ./vel.sgy",
+        default=str(DEFAULT_VIEWER_CONFIG.default_segy_path),
+        help="Path to SEG-Y file. Defaults to project data/raw/vel.sgy",
     )
     parser.add_argument(
         "--debug-ui",
@@ -110,49 +113,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--interval-inline",
         type=int,
-        default=4,
+        default=DEFAULT_VIEWER_CONFIG.interval_inline,
         help="Inline downsampling interval, e.g. 4 means take every 4th inline",
     )
     parser.add_argument(
         "--interval-xline",
         type=int,
-        default=4,
+        default=DEFAULT_VIEWER_CONFIG.interval_xline,
         help="Crossline downsampling interval, e.g. 4 means take every 4th crossline",
     )
     parser.add_argument(
         "--interval-sample",
         type=int,
-        default=4,
+        default=DEFAULT_VIEWER_CONFIG.interval_sample,
         help="Sample downsampling interval, e.g. 4 means take every 4th sample",
     )
     parser.add_argument(
         "--step-inline",
         type=float,
-        default=20.0,
+        default=DEFAULT_VIEWER_CONFIG.step_inline,
         help="Displayed inline spacing in the 3D scene",
     )
     parser.add_argument(
         "--step-xline",
         type=float,
-        default=20.0,
+        default=DEFAULT_VIEWER_CONFIG.step_xline,
         help="Displayed crossline spacing in the 3D scene",
     )
     parser.add_argument(
         "--step-sample",
         type=float,
-        default=10.0,
+        default=DEFAULT_VIEWER_CONFIG.step_sample,
         help="Displayed sample spacing in the 3D scene",
     )
     parser.add_argument(
         "--clip-percentile",
         type=float,
-        default=99.0,
+        default=DEFAULT_VIEWER_CONFIG.clip_percentile,
         help="Clip symmetric amplitudes/velocities by percentile for rendering",
     )
     parser.add_argument(
         "--opacity",
         type=float,
-        default=0.85,
+        default=DEFAULT_VIEWER_CONFIG.opacity,
         help="Opacity for the displayed slices",
     )
     return parser.parse_args()
@@ -479,12 +482,6 @@ def create_axis_labels(
     return labels
 
 
-def format_value(value: float) -> str:
-    if float(value).is_integer():
-        return str(int(value))
-    return f"{float(value):.3f}"
-
-
 def configure_default_camera(renderer: vtk.vtkRenderer, image: vtk.vtkImageData) -> None:
     x_min, x_max, y_min, y_max, z_min, z_max = image.GetBounds()
     center = (
@@ -570,7 +567,7 @@ class ExtractRangeDialog(QtWidgets.QDialog):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("提取范围属性")
+        self.setWindowTitle("Extract Range")
         self.setModal(True)
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -606,7 +603,7 @@ class ExtractRangeDialog(QtWidgets.QDialog):
 class ExtractHorizonDialog(QtWidgets.QDialog):
     def __init__(self, min_voxels: int = 1, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("提取包络层")
+        self.setWindowTitle("Extract Horizons")
         self.setModal(True)
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -637,7 +634,7 @@ class ExtractHorizonDialog(QtWidgets.QDialog):
 class ExtractControlPointsDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("提取控制点")
+        self.setWindowTitle("Extract Control Points")
         self.setModal(True)
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -688,7 +685,7 @@ class ExtractControlPointsDialog(QtWidgets.QDialog):
 class EditMasterPointDialog(QtWidgets.QDialog):
     def __init__(self, surface_points: list[ControlPoint], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("编辑主控点")
+        self.setWindowTitle("Edit Master Point")
         self.setModal(True)
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -1171,7 +1168,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self._vtk_initialized = False
         self._render_pending = False
 
-        self.setWindowTitle("SEG-Y Slice Viewer")
+        self.setWindowTitle(APP_NAME)
         self.resize(2200, 1400)
 
         central = QtWidgets.QWidget()
@@ -1193,25 +1190,25 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         data_header.setFont(data_header_font)
         data_layout.addWidget(data_header)
 
-        seismic_group = QtWidgets.QGroupBox("地震")
+        seismic_group = QtWidgets.QGroupBox("Seismic")
         seismic_layout = QtWidgets.QVBoxLayout(seismic_group)
         self.seismic_list = QtWidgets.QListWidget()
         seismic_layout.addWidget(self.seismic_list)
         data_layout.addWidget(seismic_group)
 
-        attributes_group = QtWidgets.QGroupBox("属性")
+        attributes_group = QtWidgets.QGroupBox("Attributes")
         attributes_layout = QtWidgets.QVBoxLayout(attributes_group)
         self.attributes_list = QtWidgets.QListWidget()
         attributes_layout.addWidget(self.attributes_list)
         data_layout.addWidget(attributes_group)
 
-        horizons_group = QtWidgets.QGroupBox("层位")
+        horizons_group = QtWidgets.QGroupBox("Horizons")
         horizons_layout = QtWidgets.QVBoxLayout(horizons_group)
         self.horizons_list = QtWidgets.QListWidget()
         horizons_layout.addWidget(self.horizons_list)
         data_layout.addWidget(horizons_group)
 
-        wells_group = QtWidgets.QGroupBox("井 / 控制点")
+        wells_group = QtWidgets.QGroupBox("Control Points")
         wells_layout = QtWidgets.QVBoxLayout(wells_group)
         self.control_points_list = QtWidgets.QListWidget()
         wells_layout.addWidget(self.control_points_list)
@@ -1259,7 +1256,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         note.setWordWrap(True)
         panel_layout.addWidget(note)
 
-        self.reset_view_button = QtWidgets.QPushButton("Reset 视角")
+        self.reset_view_button = QtWidgets.QPushButton("Reset View")
         self.reset_view_button.clicked.connect(self.reset_view)
         panel_layout.addWidget(self.reset_view_button)
 
@@ -1274,7 +1271,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.attribute_display_max_edit.setValidator(range_validator)
         attribute_display_layout.addWidget(self.attribute_display_min_edit, 0, 1)
         attribute_display_layout.addWidget(self.attribute_display_max_edit, 1, 1)
-        self.apply_attribute_display_button = QtWidgets.QPushButton("应用属性色标")
+        self.apply_attribute_display_button = QtWidgets.QPushButton("Apply Attribute Display")
         self.apply_attribute_display_button.clicked.connect(self.apply_attribute_display)
         attribute_display_layout.addWidget(self.apply_attribute_display_button, 2, 0, 1, 2)
         attribute_display_layout.addWidget(QtWidgets.QLabel("Opacity"), 3, 0)
@@ -1286,30 +1283,30 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
 
         range_group = QtWidgets.QGroupBox("Extract Range")
         range_layout = QtWidgets.QVBoxLayout(range_group)
-        self.extract_button = QtWidgets.QPushButton("打开范围提取窗口")
+        self.extract_button = QtWidgets.QPushButton("Open Range Extraction")
         self.extract_button.clicked.connect(self.open_extract_range_dialog)
         range_layout.addWidget(self.extract_button)
         panel_layout.addWidget(range_group)
 
         envelope_group = QtWidgets.QGroupBox("Extract Horizon Envelopes")
         envelope_layout = QtWidgets.QVBoxLayout(envelope_group)
-        self.extract_envelope_button = QtWidgets.QPushButton("打开包络层提取窗口")
+        self.extract_envelope_button = QtWidgets.QPushButton("Open Horizon Extraction")
         self.extract_envelope_button.clicked.connect(self.open_extract_horizon_dialog)
         envelope_layout.addWidget(self.extract_envelope_button)
         panel_layout.addWidget(envelope_group)
 
         control_points_group = QtWidgets.QGroupBox("Extract Control Points")
         control_points_layout = QtWidgets.QVBoxLayout(control_points_group)
-        self.extract_control_points_button = QtWidgets.QPushButton("打开控制点提取窗口")
+        self.extract_control_points_button = QtWidgets.QPushButton("Open Control Point Extraction")
         self.extract_control_points_button.clicked.connect(self.open_extract_control_points_dialog)
         control_points_layout.addWidget(self.extract_control_points_button)
-        self.edit_master_point_button = QtWidgets.QPushButton("编辑主控点")
+        self.edit_master_point_button = QtWidgets.QPushButton("Edit Master Point")
         self.edit_master_point_button.clicked.connect(self.open_edit_master_point_dialog)
         control_points_layout.addWidget(self.edit_master_point_button)
-        self.rebuild_horizon_button = QtWidgets.QPushButton("根据控制点重建包络面")
+        self.rebuild_horizon_button = QtWidgets.QPushButton("Rebuild Horizon from Control Points")
         self.rebuild_horizon_button.clicked.connect(self.rebuild_horizon_from_control_points)
         control_points_layout.addWidget(self.rebuild_horizon_button)
-        control_points_layout.addWidget(QtWidgets.QLabel("控制点显示大小"))
+        control_points_layout.addWidget(QtWidgets.QLabel("Control Point Display Size"))
         self.control_point_size_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.control_point_size_slider.setRange(20, 300)
         self.control_point_size_slider.valueChanged.connect(self.change_control_point_size)
@@ -1326,7 +1323,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.horizon_display_max_edit.setValidator(range_validator)
         horizon_display_layout.addWidget(self.horizon_display_min_edit, 0, 1)
         horizon_display_layout.addWidget(self.horizon_display_max_edit, 1, 1)
-        self.apply_horizon_display_button = QtWidgets.QPushButton("应用层位色标")
+        self.apply_horizon_display_button = QtWidgets.QPushButton("Apply Horizon Display")
         self.apply_horizon_display_button.clicked.connect(self.apply_horizon_display)
         horizon_display_layout.addWidget(self.apply_horizon_display_button, 2, 0, 1, 2)
         horizon_display_layout.addWidget(QtWidgets.QLabel("Opacity"), 3, 0)
@@ -1353,7 +1350,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.control_points_list.currentItemChanged.connect(self.change_control_point_set)
         self.control_points_list.itemChanged.connect(self.toggle_control_point_set_visibility)
 
-        self.seismic_list.addItem("当前地震体")
+        self.seismic_list.addItem("Seismic")
         self.refresh_attributes()
         self.refresh_horizons()
         self.refresh_control_points()
@@ -1607,7 +1604,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "No Envelopes",
-                "当前属性里没有满足条件的独立三维块可用于提取包络。",
+                "No envelope components met the minimum voxel threshold.",
             )
             return
         self.refresh_horizons()
@@ -1622,7 +1619,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "No Horizon",
-                "请先在层位栏中选中一个闭合层位，再提取控制点。",
+                "Select a horizon before extracting control points.",
             )
             return
         dialog = ExtractControlPointsDialog(self)
@@ -1636,7 +1633,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "No Control Points",
-                "当前层位未生成有效控制点，请调整采样间隔后重试。",
+                "No control points were generated for the current horizon.",
             )
             return
         self.refresh_control_points()
@@ -1657,7 +1654,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "No Master Points",
-                "当前控制点集中没有可编辑的面上主控点。",
+                "The current control point set does not contain editable master points.",
             )
             return
         dialog = EditMasterPointDialog(surface_points, self)
@@ -1671,7 +1668,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Edit Failed",
-                "主控点编辑失败。",
+                "Failed to update the selected master point.",
             )
             return
         self.refresh_control_points()
@@ -1684,7 +1681,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Rebuild Failed",
-                "未能根据当前控制点重建包络面。",
+                "Failed to rebuild a horizon from the current control point set.",
             )
             return
         self.refresh_horizons()

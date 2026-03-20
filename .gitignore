@@ -1,0 +1,18 @@
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Large seismic source data
+/data/raw/*.sgy
+/data/raw/*.segy
+/data/raw/*.sgy.*
+
+# Generated outputs
+/data/derived/*
+!/data/derived/.gitkeep
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
