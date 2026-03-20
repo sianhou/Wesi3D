@@ -12,6 +12,7 @@ Default behavior:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,14 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit(
         "Missing dependency: vtk\n"
         "Install with: pip install vtk"
+    ) from exc
+
+try:
+    from PySide6 import QtCore, QtGui, QtWidgets
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(
+        "Missing dependency: PySide6\n"
+        "Install with: pip install PySide6"
     ) from exc
 
 INLINE_FIELD = 189
@@ -114,6 +123,16 @@ def parse_args() -> argparse.Namespace:
 def debug_log(enabled: bool, message: str) -> None:
     if enabled:
         print(f"[debug-ui] {message}", flush=True)
+
+
+def normalize_macos_gui_env(debug_ui: bool) -> None:
+    if sys.platform != "darwin":
+        return
+    display = os.environ.get("DISPLAY")
+    if not display:
+        return
+    debug_log(debug_ui, f"unsetting DISPLAY for macOS GUI startup: {display}")
+    os.environ.pop("DISPLAY", None)
 
 
 def validate_interval(name: str, value: int) -> int:
@@ -422,6 +441,62 @@ def format_value(value: float) -> str:
     return f"{float(value):.3f}"
 
 
+class AxisControl(QtWidgets.QGroupBox):
+    value_changed = QtCore.Signal(int)
+
+    def __init__(self, title: str, values: np.ndarray, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(title, parent)
+        self.values = values
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.slider.setRange(0, len(values) - 1)
+        self.slider.setTracking(True)
+        layout.addWidget(self.slider)
+
+        row = QtWidgets.QHBoxLayout()
+        self.index_label = QtWidgets.QLabel("")
+        self.value_edit = QtWidgets.QLineEdit()
+        self.value_edit.setValidator(QtGui.QDoubleValidator())
+        self.go_button = QtWidgets.QPushButton("Set")
+        row.addWidget(self.index_label)
+        row.addWidget(self.value_edit)
+        row.addWidget(self.go_button)
+        layout.addLayout(row)
+
+        self.slider.valueChanged.connect(self._on_slider_changed)
+        self.go_button.clicked.connect(self._apply_value)
+        self.value_edit.returnPressed.connect(self._apply_value)
+
+        self.set_index(len(values) // 2)
+
+    def _on_slider_changed(self, index: int) -> None:
+        self.index_label.setText(f"index={index}")
+        self.value_edit.setText(format_value(self.values[index]))
+        self.value_changed.emit(index)
+
+    def _apply_value(self) -> None:
+        text = self.value_edit.text().strip()
+        if not text:
+            return
+        try:
+            value = float(text)
+        except ValueError:
+            return
+        index = int(np.argmin(np.abs(self.values.astype(np.float64) - value)))
+        self.set_index(index)
+
+    def set_index(self, index: int) -> None:
+        index = max(0, min(index, len(self.values) - 1))
+        was_blocked = self.slider.blockSignals(True)
+        self.slider.setValue(index)
+        self.slider.blockSignals(was_blocked)
+        self.index_label.setText(f"index={index}")
+        self.value_edit.setText(format_value(self.values[index]))
+        self.value_changed.emit(index)
+
+
 class SliceUpdater:
     def __init__(
         self,
@@ -449,6 +524,14 @@ class SliceUpdater:
         }
         self.update_overlay()
 
+    def current_text(self) -> str:
+        return (
+            f"{self.segy_path.name}\n"
+            f"Crossline: {format_value(self.xlines[self.indices['xline']])}\n"
+            f"Inline: {format_value(self.inlines[self.indices['inline']])}\n"
+            f"Sample: {format_value(self.samples[self.indices['sample']])}"
+        )
+
     def set_index(self, orientation: str, index: int) -> None:
         max_index = {
             "xline": len(self.xlines) - 1,
@@ -462,52 +545,102 @@ class SliceUpdater:
         self.interactor.GetRenderWindow().Render()
 
     def update_overlay(self) -> None:
-        self.overlay.SetInput(
-            f"{self.segy_path.name}\n"
-            f"Crossline: {format_value(self.xlines[self.indices['xline']])}\n"
-            f"Inline: {format_value(self.inlines[self.indices['inline']])}\n"
-            f"Sample: {format_value(self.samples[self.indices['sample']])}\n"
-            "Drag sliders at bottom/right to update slices"
+        self.overlay.SetInput(self.current_text())
+
+
+class ControlPanelWindow(QtWidgets.QMainWindow):
+    def __init__(
+        self,
+        updater: SliceUpdater,
+        interactor: vtk.vtkRenderWindowInteractor,
+        render_window: vtk.vtkRenderWindow,
+        xlines: np.ndarray,
+        inlines: np.ndarray,
+        samples: np.ndarray,
+        debug_ui: bool,
+    ) -> None:
+        super().__init__()
+        self.updater = updater
+        self.interactor = interactor
+        self.render_window = render_window
+        self.debug_ui = debug_ui
+
+        self.setWindowTitle("SEG-Y Control Panel")
+        self.resize(520, 760)
+
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
+
+        header = QtWidgets.QLabel("SEG-Y Slice Prototype")
+        header_font = QtGui.QFont()
+        header_font.setPointSize(18)
+        header_font.setBold(True)
+        header.setFont(header_font)
+        layout.addWidget(header)
+
+        self.info_label = QtWidgets.QLabel("")
+        info_font = QtGui.QFont("Menlo")
+        info_font.setPointSize(11)
+        self.info_label.setFont(info_font)
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        note = QtWidgets.QLabel(
+            "VTK uses a separate native window.\n"
+            "Use the controls below to move the three orthogonal slices."
         )
+        note.setWordWrap(True)
+        layout.addWidget(note)
 
+        self.xline_control = AxisControl("Crossline", xlines)
+        self.inline_control = AxisControl("Inline", inlines)
+        self.sample_control = AxisControl("Sample", samples)
+        layout.addWidget(self.xline_control)
+        layout.addWidget(self.inline_control)
+        layout.addWidget(self.sample_control)
+        layout.addStretch(1)
 
-def add_slider_widget(
-    interactor: vtk.vtkRenderWindowInteractor,
-    title: str,
-    minimum: int,
-    maximum: int,
-    value: int,
-    point1: tuple[float, float],
-    point2: tuple[float, float],
-    callback,
-) -> vtk.vtkSliderWidget:
-    rep = vtk.vtkSliderRepresentation2D()
-    rep.SetMinimumValue(minimum)
-    rep.SetMaximumValue(maximum)
-    rep.SetValue(value)
-    rep.SetTitleText(title)
-    rep.GetPoint1Coordinate().SetCoordinateSystemToNormalizedDisplay()
-    rep.GetPoint1Coordinate().SetValue(point1[0], point1[1])
-    rep.GetPoint2Coordinate().SetCoordinateSystemToNormalizedDisplay()
-    rep.GetPoint2Coordinate().SetValue(point2[0], point2[1])
-    rep.SetSliderLength(0.018)
-    rep.SetSliderWidth(0.03)
-    rep.SetTubeWidth(0.006)
-    rep.SetLabelHeight(0.02)
-    rep.SetTitleHeight(0.02)
+        self.xline_control.value_changed.connect(lambda index: self._set_index("xline", index))
+        self.inline_control.value_changed.connect(lambda index: self._set_index("inline", index))
+        self.sample_control.value_changed.connect(lambda index: self._set_index("sample", index))
 
-    widget = vtk.vtkSliderWidget()
-    widget.SetInteractor(interactor)
-    widget.SetRepresentation(rep)
-    widget.SetAnimationModeToAnimate()
-    widget.EnabledOn()
+        self.event_timer = QtCore.QTimer(self)
+        self.event_timer.timeout.connect(self._pump_vtk_events)
+        self.event_timer.start(16)
 
-    def on_interaction(obj, _event) -> None:
-        slider_value = int(round(obj.GetRepresentation().GetValue()))
-        callback(slider_value)
+        self.refresh_info()
 
-    widget.AddObserver(vtk.vtkCommand.InteractionEvent, on_interaction)
-    return widget
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        debug_log(
+            self.debug_ui,
+            f"panel showEvent: visible={self.isVisible()} active={self.isActiveWindow()} geometry={self.geometry().getRect()}",
+        )
+        QtCore.QTimer.singleShot(0, self._show_vtk_window)
+
+    def _show_vtk_window(self) -> None:
+        self.render_window.Render()
+        debug_log(self.debug_ui, "vtk native window render completed")
+
+    def _set_index(self, orientation: str, index: int) -> None:
+        self.updater.set_index(orientation, index)
+        self.refresh_info()
+
+    def refresh_info(self) -> None:
+        self.info_label.setText(self.updater.current_text())
+
+    def _pump_vtk_events(self) -> None:
+        if hasattr(self.interactor, "ProcessEvents"):
+            try:
+                self.interactor.ProcessEvents()
+            except Exception as exc:
+                debug_log(self.debug_ui, f"ProcessEvents failed: {exc}")
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.event_timer.stop()
+        self.render_window.Finalize()
+        super().closeEvent(event)
 
 
 def launch_vtk_viewer(
@@ -523,6 +656,8 @@ def launch_vtk_viewer(
     opacity_scale: float,
     debug_ui: bool = False,
 ) -> int:
+    normalize_macos_gui_env(debug_ui)
+
     lut = create_lookup_table(image, clip_percentile)
     dims = image.GetDimensions()
     xline_actor = create_slice_actor(image, "xline", dims[0] // 2, lut, opacity_scale)
@@ -578,45 +713,35 @@ def launch_vtk_viewer(
         segy_path=segy_path,
     )
 
-    widgets = [
-        add_slider_widget(
-            interactor,
-            "Crossline",
-            0,
-            len(xlines) - 1,
-            len(xlines) // 2,
-            (0.12, 0.08),
-            (0.88, 0.08),
-            lambda index: updater.set_index("xline", index),
-        ),
-        add_slider_widget(
-            interactor,
-            "Inline",
-            0,
-            len(inlines) - 1,
-            len(inlines) // 2,
-            (0.12, 0.03),
-            (0.88, 0.03),
-            lambda index: updater.set_index("inline", index),
-        ),
-        add_slider_widget(
-            interactor,
-            "Sample",
-            0,
-            len(samples) - 1,
-            len(samples) // 2,
-            (0.94, 0.15),
-            (0.94, 0.88),
-            lambda index: updater.set_index("sample", index),
-        ),
-    ]
-
     renderer.ResetCamera()
-    render_window.Render()
     debug_log(debug_ui, f"vtk render window created: {type(render_window).__name__}")
-    debug_log(debug_ui, f"sliders ready: xline={len(xlines)} inline={len(inlines)} sample={len(samples)}")
     interactor.Initialize()
-    interactor.Start()
+    render_window.Render()
+    debug_log(debug_ui, f"control ranges: xline={len(xlines)} inline={len(inlines)} sample={len(samples)}")
+
+    app = QtWidgets.QApplication.instance()
+    owns_app = app is None
+    if app is None:
+        app = QtWidgets.QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
+    debug_log(debug_ui, f"qt platform={app.platformName()} DISPLAY={os.environ.get('DISPLAY')}")
+
+    panel = ControlPanelWindow(
+        updater=updater,
+        interactor=interactor,
+        render_window=render_window,
+        xlines=xlines,
+        inlines=inlines,
+        samples=samples,
+        debug_ui=debug_ui,
+    )
+    panel.show()
+    panel.raise_()
+    panel.activateWindow()
+    debug_log(debug_ui, f"panel shown: visible={panel.isVisible()} active={panel.isActiveWindow()}")
+
+    if owns_app:
+        return app.exec()
     return 0
 
 
