@@ -3,15 +3,15 @@
 3D SEG-Y viewer for a velocity cube.
 
 Default behavior:
-- open data/raw/vel.sgy
-- read inline / crossline from trace header bytes 189 / 193
-- downsample a large cube to a manageable volume
+- start an empty viewer
+- load SEG-Y volumes on demand
 - display three orthogonal slices with VTK
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -43,7 +43,8 @@ except ImportError as exc:  # pragma: no cover
         "Install with: pip install PySide6"
     ) from exc
 
-from ..config import DEFAULT_VIEWER_CONFIG
+from ..config import DEFAULT_VIEWER_CONFIG, DERIVED_DATA_DIR
+from ..data.volume_data import VolumeData
 from ..data.attribute_data import (
     AttributeVolume,
     RenderSpacing,
@@ -51,12 +52,16 @@ from ..data.attribute_data import (
     load_attribute_from_volume,
 )
 from ..data.volume_data import load_segy_geometry, read_segy_volume
+from .data_panel import DataPanelItem, DataPanelWidget
 from ..processing.control_points import (
     ControlPoint,
-    apply_master_point_z_move,
+    MasterMove,
+    apply_master_point_z_moves,
     extract_control_points,
     master_control_points,
+    rebuild_mask_from_master_points,
 )
+from ..utils.constants import INLINE_FIELD, XLINE_FIELD
 from ..processing.volume_processing import extract_connected_components, extract_range_volume
 from ..utils.constants import APP_NAME
 from ..utils.formatting import format_value
@@ -76,6 +81,8 @@ class HorizonSurface:
     visible: bool = True
     component_mask: np.ndarray | None = None
     source_attribute_name: str = ""
+    control_point_set: ControlPointSet | None = None
+    base_polydata: vtk.vtkPolyData | None = None
 
 
 @dataclass
@@ -84,27 +91,35 @@ class ControlPointSet:
     actor: vtk.vtkActor
     sphere_source: vtk.vtkSphereSource
     polydata: vtk.vtkPolyData
+    master_actor: vtk.vtkActor
+    master_sphere_source: vtk.vtkSphereSource
+    master_polydata: vtk.vtkPolyData
+    selected_master_actor: vtk.vtkActor
+    selected_master_sphere_source: vtk.vtkSphereSource
+    selected_master_polydata: vtk.vtkPolyData
     points: list[ControlPoint]
     horizon_name: str
     source_attribute_name: str
     source_horizon_name: str
     original_horizon_mask: np.ndarray
     display_scale: float = 1.0
+    link_radius: float = 8.0
     visible: bool = True
 
     @property
     def master_points(self) -> list[ControlPoint]:
         return master_control_points(self.points)
 
+    def master_point_by_index(self, master_index: int) -> ControlPoint | None:
+        for point in self.master_points:
+            if point.master_index == master_index:
+                return point
+        return None
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SEG-Y slice viewer")
-    parser.add_argument(
-        "segy_path",
-        nargs="?",
-        default=str(DEFAULT_VIEWER_CONFIG.default_segy_path),
-        help="Path to SEG-Y file. Defaults to project data/raw/vel.sgy",
-    )
+    parser.add_argument("segy_path", nargs="?", default=None, help="Optional path to a SEG-Y file.")
     parser.add_argument(
         "--debug-ui",
         action="store_true",
@@ -241,6 +256,24 @@ def create_outline(image: vtk.vtkImageData) -> vtk.vtkActor:
     return actor
 
 
+def create_placeholder_image() -> tuple[vtk.vtkImageData, vtk.vtkLookupTable]:
+    volume = VolumeData(
+        data=np.zeros((1, 1, 1), dtype=np.float32),
+        xlines=np.asarray([0.0], dtype=np.float32),
+        inlines=np.asarray([0.0], dtype=np.float32),
+        samples=np.asarray([0.0], dtype=np.float32),
+        name="empty",
+    )
+    attribute = load_attribute_from_volume(
+        volume,
+        name="empty",
+        spacing=RenderSpacing(1.0, 1.0, 1.0),
+        clip_percentile=99.0,
+        opacity=0.0,
+    )
+    return attribute.image, attribute.lut
+
+
 def create_horizon_surface_actor(
     mask: np.ndarray,
     scalar_values: np.ndarray,
@@ -331,115 +364,209 @@ def create_control_point_actor(
     points: list[ControlPoint],
     spacing: RenderSpacing,
     display_scale: float = 1.0,
-) -> tuple[vtk.vtkActor, vtk.vtkPolyData, vtk.vtkSphereSource]:
-    vtk_points = vtk.vtkPoints()
-    values = vtk.vtkFloatArray()
-    values.SetName("value")
-    kinds = vtk.vtkUnsignedCharArray()
-    kinds.SetName("kind")
+) -> tuple[
+    vtk.vtkActor,
+    vtk.vtkPolyData,
+    vtk.vtkSphereSource,
+    vtk.vtkActor,
+    vtk.vtkPolyData,
+    vtk.vtkSphereSource,
+    vtk.vtkActor,
+    vtk.vtkPolyData,
+    vtk.vtkSphereSource,
+]:
+    def _make_polydata(source_points: list[ControlPoint]) -> vtk.vtkPolyData:
+        vtk_points = vtk.vtkPoints()
+        values = vtk.vtkFloatArray()
+        values.SetName("value")
+        kinds = vtk.vtkUnsignedCharArray()
+        kinds.SetName("kind")
 
-    for point in points:
-        vtk_points.InsertNextPoint(
-            float(point.xline_index) * float(spacing.xline),
-            float(point.inline_index) * float(spacing.inline),
-            float(point.sample_index) * float(spacing.sample),
+        for point in source_points:
+            vtk_points.InsertNextPoint(
+                float(point.xline_index) * float(spacing.xline),
+                float(point.inline_index) * float(spacing.inline),
+                float(point.sample_index) * float(spacing.sample),
+            )
+            values.InsertNextValue(float(point.value))
+            kinds.InsertNextValue(1 if point.kind == "surface" else 0)
+
+        polydata = vtk.vtkPolyData()
+        polydata.SetPoints(vtk_points)
+        polydata.GetPointData().AddArray(values)
+        polydata.GetPointData().AddArray(kinds)
+        polydata.GetPointData().SetActiveScalars("value")
+        return polydata
+
+    def _make_actor(
+        polydata: vtk.vtkPolyData,
+        *,
+        radius_factor: float,
+        theta: int,
+        phi: int,
+        color: tuple[float, float, float],
+        opacity: float,
+    ) -> tuple[vtk.vtkActor, vtk.vtkSphereSource]:
+        sphere = vtk.vtkSphereSource()
+        radius = max(
+            min(spacing.xline, spacing.inline, spacing.sample) * radius_factor * float(display_scale),
+            2.0,
         )
-        values.InsertNextValue(float(point.value))
-        kinds.InsertNextValue(1 if point.kind == "surface" else 0)
+        sphere.SetRadius(radius)
+        sphere.SetThetaResolution(theta)
+        sphere.SetPhiResolution(phi)
 
-    polydata = vtk.vtkPolyData()
-    polydata.SetPoints(vtk_points)
-    polydata.GetPointData().AddArray(values)
-    polydata.GetPointData().AddArray(kinds)
-    polydata.GetPointData().SetActiveScalars("value")
+        mapper = vtk.vtkGlyph3DMapper()
+        mapper.SetInputData(polydata)
+        mapper.SetSourceConnection(sphere.GetOutputPort())
+        mapper.ScalingOff()
+        mapper.ScalarVisibilityOff()
 
-    sphere = vtk.vtkSphereSource()
-    radius = max(min(spacing.xline, spacing.inline, spacing.sample) * 0.18 * float(display_scale), 1.5)
-    sphere.SetRadius(radius)
-    sphere.SetThetaResolution(16)
-    sphere.SetPhiResolution(16)
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetOpacity(opacity)
+        return actor, sphere
 
-    mapper = vtk.vtkGlyph3DMapper()
-    mapper.SetInputData(polydata)
-    mapper.SetSourceConnection(sphere.GetOutputPort())
-    mapper.ScalingOff()
-    mapper.ScalarVisibilityOff()
+    polydata = _make_polydata(points)
+    actor, sphere = _make_actor(
+        polydata,
+        radius_factor=0.28,
+        theta=16,
+        phi=16,
+        color=(0.98, 0.80, 0.20),
+        opacity=0.92,
+    )
 
-    actor = vtk.vtkActor()
-    actor.SetMapper(mapper)
-    actor.GetProperty().SetColor(0.98, 0.80, 0.20)
-    actor.GetProperty().SetOpacity(0.95)
-    return actor, polydata, sphere
+    master_points = master_control_points(points)
+    master_polydata = _make_polydata(master_points)
+    master_actor, master_sphere = _make_actor(
+        master_polydata,
+        radius_factor=0.44,
+        theta=20,
+        phi=20,
+        color=(1.0, 0.28, 0.18),
+        opacity=0.98,
+    )
+    selected_master_polydata = _make_polydata([])
+    selected_master_actor, selected_master_sphere = _make_actor(
+        selected_master_polydata,
+        radius_factor=0.572,
+        theta=24,
+        phi=24,
+        color=(0.22, 1.0, 0.40),
+        opacity=1.0,
+    )
+    selected_master_actor.SetVisibility(False)
+    return (
+        actor,
+        polydata,
+        sphere,
+        master_actor,
+        master_polydata,
+        master_sphere,
+        selected_master_actor,
+        selected_master_polydata,
+        selected_master_sphere,
+    )
 
 
 def create_horizon_surface_from_control_points(
+    base_polydata: vtk.vtkPolyData,
     points: list[ControlPoint],
     spacing: RenderSpacing,
     clip_percentile: float,
 ) -> tuple[vtk.vtkActor, vtk.vtkPolyData, vtk.vtkPolyDataMapper, vtk.vtkLookupTable, tuple[float, float]]:
     if len(points) < 4:
-        raise ValueError("At least 4 control points are required to rebuild a closed surface.")
+        raise ValueError("At least 4 master points are required to deform a horizon.")
+    if base_polydata.GetNumberOfPoints() == 0:
+        raise ValueError("The source horizon surface is empty.")
 
-    vtk_points = vtk.vtkPoints()
-    scalars = vtk.vtkFloatArray()
-    scalars.SetName("value")
-    for point in points:
-        vtk_points.InsertNextPoint(
-            float(point.xline_index) * float(spacing.xline),
-            float(point.inline_index) * float(spacing.inline),
-            float(point.sample_index) * float(spacing.sample),
+    master_points = [point for point in points if point.kind == "surface" and point.master_index is not None]
+    if len(master_points) < 4:
+        raise ValueError("At least 4 master points are required to deform a horizon.")
+
+    deformed = vtk.vtkPolyData()
+    deformed.DeepCopy(base_polydata)
+
+    source_points = base_polydata.GetPoints()
+    if source_points is None:
+        raise ValueError("The source horizon surface does not contain geometry.")
+    source_points_array = numpy_support.vtk_to_numpy(source_points.GetData()).astype(np.float64, copy=True)
+
+    anchors_xy = np.asarray(
+        [
+            (
+                float(point.xline_index) * float(spacing.xline),
+                float(point.inline_index) * float(spacing.inline),
+            )
+            for point in master_points
+        ],
+        dtype=np.float64,
+    )
+    anchors_dz = np.asarray(
+        [float(point.dz) * float(spacing.sample) for point in master_points],
+        dtype=np.float64,
+    )
+    if np.allclose(anchors_dz, 0.0):
+        raise ValueError("The master points do not contain any deformation yet.")
+
+    sigma = max(
+        min(float(spacing.xline), float(spacing.inline)) * 6.0,
+        1.0,
+    )
+
+    vertices_xy = source_points_array[:, :2]
+    deltas = vertices_xy[:, None, :] - anchors_xy[None, :, :]
+    distance2 = np.sum(deltas * deltas, axis=2)
+    weights = np.exp(-distance2 / (2.0 * sigma * sigma))
+    weight_sums = np.sum(weights, axis=1)
+    dz = np.divide(
+        weights @ anchors_dz,
+        weight_sums,
+        out=np.zeros_like(weight_sums),
+        where=weight_sums > 1e-12,
+    )
+    deformed_points_array = np.array(source_points_array, copy=True)
+    deformed_points_array[:, 2] += dz
+
+    # Pin the nearest surface vertices to the master-point z values so the edited
+    # shape follows the control points as closely as the existing mesh permits.
+    nearest_indices = np.argmin(distance2, axis=0)
+    for point, nearest_index in zip(master_points, nearest_indices):
+        target_z = float(point.sample_index) * float(spacing.sample)
+        deformed_points_array[int(nearest_index), 2] = target_z
+
+    deformed_points = vtk.vtkPoints()
+    deformed_points.SetData(
+        numpy_support.numpy_to_vtk(
+            np.ascontiguousarray(deformed_points_array),
+            deep=True,
+            array_type=vtk.VTK_FLOAT,
         )
-        scalars.InsertNextValue(float(point.value))
+    )
 
-    point_cloud = vtk.vtkPolyData()
-    point_cloud.SetPoints(vtk_points)
-    point_cloud.GetPointData().SetScalars(scalars)
-
-    delaunay = vtk.vtkDelaunay3D()
-    delaunay.SetInputData(point_cloud)
-    delaunay.SetTolerance(0.001)
-    delaunay.SetAlpha(0.0)
-
-    surface = vtk.vtkDataSetSurfaceFilter()
-    surface.SetInputConnection(delaunay.GetOutputPort())
-
-    clean = vtk.vtkCleanPolyData()
-    clean.SetInputConnection(surface.GetOutputPort())
-
-    smooth = vtk.vtkWindowedSincPolyDataFilter()
-    smooth.SetInputConnection(clean.GetOutputPort())
-    smooth.SetNumberOfIterations(25)
-    smooth.BoundarySmoothingOn()
-    smooth.FeatureEdgeSmoothingOff()
-    smooth.SetPassBand(0.06)
-    smooth.NonManifoldSmoothingOn()
-    smooth.NormalizeCoordinatesOn()
-
-    interpolator = vtk.vtkPointInterpolator()
-    interpolator.SetInputConnection(smooth.GetOutputPort())
-    interpolator.SetSourceData(point_cloud)
-    interpolator.SetNullPointsStrategyToClosestPoint()
-    interpolator.Update()
+    deformed.SetPoints(deformed_points)
 
     normals = vtk.vtkPolyDataNormals()
-    normals.SetInputConnection(interpolator.GetOutputPort())
+    normals.SetInputData(deformed)
     normals.ConsistencyOn()
     normals.SplittingOff()
     normals.AutoOrientNormalsOn()
     normals.Update()
 
-    polydata = vtk.vtkPolyData()
-    polydata.DeepCopy(normals.GetOutput())
-    if polydata.GetNumberOfPoints() == 0:
+    surface_polydata = vtk.vtkPolyData()
+    surface_polydata.DeepCopy(normals.GetOutput())
+    if surface_polydata.GetNumberOfPoints() == 0 or surface_polydata.GetNumberOfPolys() == 0:
         raise ValueError("Empty rebuilt horizon surface.")
 
-    point_scalars = polydata.GetPointData().GetScalars()
+    point_scalars = surface_polydata.GetPointData().GetScalars()
     scalar_array = numpy_support.vtk_to_numpy(point_scalars)
     scalar_range = (float(np.min(scalar_array)), float(np.max(scalar_array)))
     lut = create_lookup_table_from_scalars(scalar_array, clip_percentile)
 
     mapper = vtk.vtkPolyDataMapper()
-    mapper.SetInputData(polydata)
+    mapper.SetInputData(surface_polydata)
     mapper.SetLookupTable(lut)
     mapper.SetUseLookupTableScalarRange(True)
     mapper.SetScalarRange(lut.GetRange())
@@ -450,7 +577,13 @@ def create_horizon_surface_from_control_points(
     actor.GetProperty().SetOpacity(0.55)
     actor.GetProperty().SetInterpolationToPhong()
     actor.GetProperty().EdgeVisibilityOff()
-    return actor, polydata, mapper, lut, scalar_range
+    return actor, surface_polydata, mapper, lut, scalar_range
+
+
+def clone_polydata(polydata: vtk.vtkPolyData) -> vtk.vtkPolyData:
+    cloned = vtk.vtkPolyData()
+    cloned.DeepCopy(polydata)
+    return cloned
 
 
 def create_axis_labels(
@@ -508,30 +641,32 @@ class AxisControl(QtWidgets.QGroupBox):
 
     def __init__(self, title: str, values: np.ndarray, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(title, parent)
-        self.values = values
+        self.values = np.asarray(values)
 
-        layout = QtWidgets.QVBoxLayout(self)
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
 
         self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider.setRange(0, len(values) - 1)
         self.slider.setTracking(True)
-        layout.addWidget(self.slider)
-
-        row = QtWidgets.QHBoxLayout()
         self.index_label = QtWidgets.QLabel("")
+        self.index_label.setMinimumWidth(60)
         self.value_edit = QtWidgets.QLineEdit()
+        self.value_edit.setMaximumWidth(88)
         self.value_edit.setValidator(QtGui.QDoubleValidator())
         self.go_button = QtWidgets.QPushButton("Set")
-        row.addWidget(self.index_label)
-        row.addWidget(self.value_edit)
-        row.addWidget(self.go_button)
-        layout.addLayout(row)
+        self.go_button.setMaximumWidth(52)
+        layout.addWidget(self.slider, stretch=1)
+        layout.addWidget(self.index_label)
+        layout.addWidget(self.value_edit)
+        layout.addWidget(self.go_button)
 
         self.slider.valueChanged.connect(self._on_slider_changed)
         self.go_button.clicked.connect(self._apply_value)
         self.value_edit.returnPressed.connect(self._apply_value)
 
-        self.set_index(len(values) // 2)
+        self.set_values(self.values)
 
     def _on_slider_changed(self, index: int) -> None:
         self.index_label.setText(f"index={index}")
@@ -557,6 +692,20 @@ class AxisControl(QtWidgets.QGroupBox):
         self.index_label.setText(f"index={index}")
         self.value_edit.setText(format_value(self.values[index]))
         self.value_changed.emit(index)
+
+    def set_values(self, values: np.ndarray, index: int | None = None) -> None:
+        self.values = np.asarray(values)
+        self.slider.blockSignals(True)
+        self.slider.setEnabled(len(self.values) > 0)
+        self.go_button.setEnabled(len(self.values) > 0)
+        self.value_edit.setEnabled(len(self.values) > 0)
+        self.slider.setRange(0, max(0, len(self.values) - 1))
+        self.slider.blockSignals(False)
+        if len(self.values) == 0:
+            self.index_label.setText("index=-")
+            self.value_edit.clear()
+            return
+        self.set_index(len(self.values) // 2 if index is None else index)
 
 
 class ExtractRangeDialog(QtWidgets.QDialog):
@@ -722,6 +871,105 @@ class EditMasterPointDialog(QtWidgets.QDialog):
             return None
 
 
+class LoadSeismicDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget | None = None, target_category: str = "seismic") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Load Seismic Data")
+        self.setModal(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+
+        self.path_edit = QtWidgets.QLineEdit()
+        browse_button = QtWidgets.QPushButton("Browse")
+        browse_button.clicked.connect(self._browse_path)
+        path_row = QtWidgets.QHBoxLayout()
+        path_row.addWidget(self.path_edit)
+        path_row.addWidget(browse_button)
+        form.addRow("SEG-Y", path_row)
+
+        self.name_edit = QtWidgets.QLineEdit()
+        form.addRow("Name", self.name_edit)
+
+        self.target_combo = QtWidgets.QComboBox()
+        self.target_combo.addItem("地震", "seismic")
+        self.target_combo.addItem("属性", "attribute")
+        index = 0 if target_category == "seismic" else 1
+        self.target_combo.setCurrentIndex(index)
+        form.addRow("导入为", self.target_combo)
+
+        int_validator = QtGui.QIntValidator(1, 10**9, self)
+        float_validator = QtGui.QDoubleValidator(self)
+
+        self.interval_inline_edit = QtWidgets.QLineEdit(str(DEFAULT_VIEWER_CONFIG.interval_inline))
+        self.interval_xline_edit = QtWidgets.QLineEdit(str(DEFAULT_VIEWER_CONFIG.interval_xline))
+        self.interval_sample_edit = QtWidgets.QLineEdit(str(DEFAULT_VIEWER_CONFIG.interval_sample))
+        for widget in (self.interval_inline_edit, self.interval_xline_edit, self.interval_sample_edit):
+            widget.setValidator(int_validator)
+        form.addRow("Inline 抽稀", self.interval_inline_edit)
+        form.addRow("Xline 抽稀", self.interval_xline_edit)
+        form.addRow("Sample 抽稀", self.interval_sample_edit)
+
+        self.step_inline_edit = QtWidgets.QLineEdit(format_value(DEFAULT_VIEWER_CONFIG.step_inline))
+        self.step_xline_edit = QtWidgets.QLineEdit(format_value(DEFAULT_VIEWER_CONFIG.step_xline))
+        self.step_sample_edit = QtWidgets.QLineEdit(format_value(DEFAULT_VIEWER_CONFIG.step_sample))
+        for widget in (self.step_inline_edit, self.step_xline_edit, self.step_sample_edit):
+            widget.setValidator(float_validator)
+        form.addRow("Inline Step", self.step_inline_edit)
+        form.addRow("Xline Step", self.step_xline_edit)
+        form.addRow("Sample Step", self.step_sample_edit)
+
+        self.inline_field_edit = QtWidgets.QLineEdit(str(INLINE_FIELD))
+        self.xline_field_edit = QtWidgets.QLineEdit(str(XLINE_FIELD))
+        for widget in (self.inline_field_edit, self.xline_field_edit):
+            widget.setValidator(QtGui.QIntValidator(1, 10**9, self))
+        form.addRow("Inline 道头位置", self.inline_field_edit)
+        form.addRow("Xline 道头位置", self.xline_field_edit)
+
+        layout.addLayout(form)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _browse_path(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select SEG-Y File",
+            "",
+            "SEG-Y Files (*.sgy *.segy);;All Files (*)",
+        )
+        if path:
+            self.path_edit.setText(path)
+            if not self.name_edit.text().strip():
+                self.name_edit.setText(Path(path).stem)
+
+    def values(self) -> dict[str, object] | None:
+        path_text = self.path_edit.text().strip()
+        if not path_text:
+            return None
+        try:
+            return {
+                "path": path_text,
+                "name": self.name_edit.text().strip() or Path(path_text).stem,
+                "target_category": str(self.target_combo.currentData()),
+                "interval_inline": max(1, int(self.interval_inline_edit.text().strip() or "1")),
+                "interval_xline": max(1, int(self.interval_xline_edit.text().strip() or "1")),
+                "interval_sample": max(1, int(self.interval_sample_edit.text().strip() or "1")),
+                "step_inline": float(self.step_inline_edit.text().strip() or "1"),
+                "step_xline": float(self.step_xline_edit.text().strip() or "1"),
+                "step_sample": float(self.step_sample_edit.text().strip() or "1"),
+                "inline_field": int(self.inline_field_edit.text().strip() or str(INLINE_FIELD)),
+                "xline_field": int(self.xline_field_edit.text().strip() or str(XLINE_FIELD)),
+            }
+        except ValueError:
+            return None
+
+
 class SliceUpdater:
     def __init__(
         self,
@@ -729,47 +977,73 @@ class SliceUpdater:
         renderer: vtk.vtkRenderer,
         bundles: dict[str, SliceActorBundle],
         overlay: vtk.vtkTextActor,
-        segy_path: Path,
-        initial_attribute: AttributeVolume,
+        segy_path: Path | None,
+        initial_attribute: AttributeVolume | None,
         spacing: RenderSpacing,
         clip_percentile: float,
         opacity: float,
     ) -> None:
         self.interactor = interactor
         self.renderer = renderer
-        self.image = initial_attribute.image
         self.bundles = bundles
         self.overlay = overlay
         self.segy_path = segy_path
         self.spacing = spacing
         self.clip_percentile = clip_percentile
         self.opacity = opacity
-        self.attributes: dict[str, AttributeVolume] = {
-            initial_attribute.name: initial_attribute
-        }
+        self.attributes: dict[str, AttributeVolume] = {}
         self.horizons: dict[str, HorizonSurface] = {}
-        self.control_point_sets: dict[str, ControlPointSet] = {}
         self.current_horizon_name: str | None = None
-        self.current_control_point_set_name: str | None = None
-        self.current_attribute_name = initial_attribute.name
-        self._sync_axes_from_current_attribute()
+        self.current_attribute_name: str | None = None
+        self.last_rebuild_error: str | None = None
+        self.image = bundles["xline"].image
+        self.xlines = np.asarray([0.0], dtype=np.float32)
+        self.inlines = np.asarray([0.0], dtype=np.float32)
+        self.samples = np.asarray([0.0], dtype=np.float32)
         self.indices = {
-            "xline": len(self.xlines) // 2,
-            "inline": len(self.inlines) // 2,
-            "sample": len(self.samples) // 2,
+            "xline": 0,
+            "inline": 0,
+            "sample": 0,
         }
+        if initial_attribute is not None:
+            self.attributes[initial_attribute.name] = initial_attribute
+            self.current_attribute_name = initial_attribute.name
+            self.image = initial_attribute.image
+            self._sync_axes_from_current_attribute()
+            self.indices = {
+                "xline": len(self.xlines) // 2,
+                "inline": len(self.inlines) // 2,
+                "sample": len(self.samples) // 2,
+            }
         self.update_overlay()
 
+    @staticmethod
+    def _unique_name(existing: dict[str, object], base_name: str) -> str:
+        new_name = base_name
+        suffix = 1
+        while new_name in existing:
+            suffix += 1
+            new_name = f"{base_name}_{suffix}"
+        return new_name
+
     def _sync_axes_from_current_attribute(self) -> None:
-        volume_data = self.current_attribute().volume_data
+        attribute = self.current_attribute()
+        if attribute is None:
+            self.xlines = np.asarray([0.0], dtype=np.float32)
+            self.inlines = np.asarray([0.0], dtype=np.float32)
+            self.samples = np.asarray([0.0], dtype=np.float32)
+            return
+        volume_data = attribute.volume_data
         self.xlines = volume_data.xlines
         self.inlines = volume_data.inlines
         self.samples = volume_data.samples
 
     def current_text(self) -> str:
+        if not self.has_attribute_data():
+            return "No data loaded\nUse 'Load Seismic Data' to import a SEG-Y volume."
         return (
-            f"{self.segy_path.name}\n"
-            f"Attribute: {self.current_attribute_name}\n"
+            f"{self.segy_path.name if self.segy_path is not None else 'No File'}\n"
+            f"Attribute: {self.current_attribute_name or '-'}\n"
             f"Crossline: {format_value(self.xlines[self.indices['xline']])}\n"
             f"Inline: {format_value(self.inlines[self.indices['inline']])}\n"
             f"Sample: {format_value(self.samples[self.indices['sample']])}"
@@ -778,23 +1052,34 @@ class SliceUpdater:
     def attribute_names(self) -> list[str]:
         return list(self.attributes.keys())
 
-    def current_attribute(self) -> AttributeVolume:
+    def has_attribute_data(self) -> bool:
+        return self.current_attribute_name is not None and self.current_attribute_name in self.attributes
+
+    def current_attribute(self) -> AttributeVolume | None:
+        if not self.has_attribute_data():
+            return None
         return self.attributes[self.current_attribute_name]
 
     def current_scalar_range(self) -> tuple[float, float]:
-        return tuple(float(v) for v in self.current_attribute().image.GetScalarRange())
+        attribute = self.current_attribute()
+        if attribute is None:
+            return (0.0, 0.0)
+        return tuple(float(v) for v in attribute.image.GetScalarRange())
 
-    def current_attribute_display_range(self) -> tuple[float, float]:
-        return tuple(float(v) for v in self.current_attribute().lut.GetRange())
+    def current_attribute_display_range(self) -> tuple[float, float] | None:
+        attribute = self.current_attribute()
+        if attribute is None:
+            return None
+        return tuple(float(v) for v in attribute.lut.GetRange())
 
     def horizon_names(self) -> list[str]:
         return list(self.horizons.keys())
 
-    def control_point_set_names(self) -> list[str]:
-        return list(self.control_point_sets.keys())
-
     def current_attribute_opacity(self) -> float:
-        return float(self.current_attribute().opacity)
+        attribute = self.current_attribute()
+        if attribute is None:
+            return float(self.opacity)
+        return float(attribute.opacity)
 
     def current_horizon_scalar_range(self) -> tuple[float, float] | None:
         if self.current_horizon_name is None:
@@ -812,6 +1097,8 @@ class SliceUpdater:
         return self.horizons[self.current_horizon_name]
 
     def set_index(self, orientation: str, index: int, render: bool = True) -> None:
+        if not self.has_attribute_data():
+            return
         max_index = {
             "xline": len(self.xlines) - 1,
             "inline": len(self.inlines) - 1,
@@ -843,9 +1130,13 @@ class SliceUpdater:
             self.interactor.GetRenderWindow().Render()
 
     def set_attribute_display_range(self, min_value: float, max_value: float, render: bool = True) -> None:
+        if not self.has_attribute_data():
+            return
         if min_value > max_value:
             min_value, max_value = max_value, min_value
         attr = self.current_attribute()
+        if attr is None:
+            return
         attr.lut.SetRange(float(min_value), float(max_value))
         attr.lut.Build()
         for bundle in self.bundles.values():
@@ -854,22 +1145,53 @@ class SliceUpdater:
             self.interactor.GetRenderWindow().Render()
 
     def set_attribute_opacity(self, opacity: float, render: bool = True) -> None:
+        if not self.has_attribute_data():
+            return
         opacity = max(0.0, min(1.0, float(opacity)))
         attr = self.current_attribute()
+        if attr is None:
+            return
         attr.opacity = opacity
         for bundle in self.bundles.values():
             bundle.actor.SetOpacity(opacity)
         if render:
             self.interactor.GetRenderWindow().Render()
 
+    def add_attribute_volume(
+        self,
+        volume_data: VolumeData,
+        *,
+        name: str | None = None,
+        opacity: float | None = None,
+        select: bool = False,
+    ) -> str:
+        base_name = volume_data.name if name is None else name
+        new_name = self._unique_name(self.attributes, base_name)
+        current_attribute = self.current_attribute()
+        source_opacity = (
+            current_attribute.opacity
+            if current_attribute is not None and opacity is None
+            else float(self.opacity if opacity is None else opacity)
+        )
+        self.attributes[new_name] = load_attribute_from_volume(
+            volume_data,
+            name=new_name,
+            spacing=self.spacing,
+            clip_percentile=self.clip_percentile,
+            opacity=source_opacity,
+        )
+        if select:
+            self.set_attribute(new_name, render=False)
+        return new_name
+
     def extract_range_attribute(self, min_value: float, max_value: float) -> str:
         source = self.current_attribute()
-        base_name = f"{source.name}_range_{format_value(min_value)}_{format_value(max_value)}"
-        new_name = base_name
-        suffix = 1
-        while new_name in self.attributes:
-            suffix += 1
-            new_name = f"{base_name}_{suffix}"
+        if source is None:
+            raise ValueError("No current attribute.")
+        new_name = self._unique_name(
+            self.attributes,
+            f"{source.name}_range_{format_value(min_value)}_{format_value(max_value)}",
+        )
 
         output_volume = extract_range_volume(
             source.volume_data,
@@ -877,17 +1199,12 @@ class SliceUpdater:
             max_value=max_value,
             name=new_name,
         )
-        self.attributes[new_name] = load_attribute_from_volume(
-            output_volume,
-            name=new_name,
-            spacing=self.spacing,
-            clip_percentile=self.clip_percentile,
-            opacity=source.opacity,
-        )
-        return new_name
+        return self.add_attribute_volume(output_volume, name=new_name, opacity=source.opacity)
 
     def extract_envelope_horizons(self, min_voxels: int = 1) -> list[str]:
         source = self.current_attribute()
+        if source is None:
+            return []
         components = extract_connected_components(
             source.volume_data,
             min_voxels=min_voxels,
@@ -948,6 +1265,16 @@ class SliceUpdater:
                 prop.SetAmbient(0.10)
                 prop.SetSpecular(0.15)
             horizon.actor.SetVisibility(horizon.visible)
+            point_set = horizon.control_point_set
+            if point_set is not None:
+                is_current = horizon_name == name
+                point_set.actor.GetProperty().SetOpacity((0.96 if is_current else 0.68) if point_set.visible else 0.0)
+                point_set.actor.GetProperty().SetColor(*( (1.0, 0.86, 0.24) if is_current else (0.92, 0.68, 0.20) ))
+                point_set.master_actor.GetProperty().SetOpacity((1.0 if is_current else 0.88) if point_set.visible else 0.0)
+                point_set.master_actor.GetProperty().SetColor(*( (1.0, 0.20, 0.12) if is_current else (0.92, 0.36, 0.22) ))
+                point_set.actor.SetVisibility(point_set.visible)
+                point_set.master_actor.SetVisibility(point_set.visible)
+                point_set.selected_master_actor.SetVisibility(False)
         if render:
             self.interactor.GetRenderWindow().Render()
 
@@ -966,6 +1293,8 @@ class SliceUpdater:
         source_attribute = self.attributes.get(horizon.source_attribute_name)
         if source_attribute is None:
             source_attribute = self.current_attribute()
+        if source_attribute is None:
+            return None
         points = extract_control_points(
             source_attribute.volume_data,
             horizon.component_mask,
@@ -973,109 +1302,158 @@ class SliceUpdater:
         )
         if not points:
             return None
-        actor, polydata, sphere_source = create_control_point_actor(points, self.spacing)
-        base_name = f"{horizon.name}_control_points"
-        new_name = base_name
-        suffix = 1
-        while new_name in self.control_point_sets:
-            suffix += 1
-            new_name = f"{base_name}_{suffix}"
-        point_set = ControlPointSet(
-            name=new_name,
-            actor=actor,
-            sphere_source=sphere_source,
-            polydata=polydata,
+        horizon_name = self.set_control_points_for_horizon(
+            horizon.name,
             points=points,
-            horizon_name=horizon.name,
             source_attribute_name=source_attribute.name,
             source_horizon_name=horizon.name,
             original_horizon_mask=np.array(horizon.component_mask, copy=True),
             display_scale=1.0,
+            visible=True,
         )
-        self.control_point_sets[new_name] = point_set
-        self.renderer.AddActor(actor)
-        self.set_current_control_point_set(new_name, render=False)
-        return new_name
-
-    def set_current_control_point_set(self, name: str | None, render: bool = True) -> None:
-        self.current_control_point_set_name = name
-        for point_set_name, point_set in self.control_point_sets.items():
-            prop = point_set.actor.GetProperty()
-            if point_set_name == name:
-                prop.SetOpacity(1.0 if point_set.visible else 0.0)
-                prop.SetColor(1.0, 0.88, 0.18)
-            else:
-                prop.SetOpacity(0.82 if point_set.visible else 0.0)
-                prop.SetColor(0.95, 0.70, 0.15)
-            point_set.actor.SetVisibility(point_set.visible)
-        if render:
-            self.interactor.GetRenderWindow().Render()
-
-    def set_control_point_set_visibility(self, name: str, visible: bool, render: bool = True) -> None:
-        point_set = self.control_point_sets[name]
-        point_set.visible = bool(visible)
-        point_set.actor.SetVisibility(point_set.visible)
-        self.set_current_control_point_set(self.current_control_point_set_name, render=False)
-        if render:
-            self.interactor.GetRenderWindow().Render()
+        point_set = self.horizons[horizon_name].control_point_set
+        if point_set is None:
+            return None
+        if not self._apply_control_point_deformation_to_horizon(horizon_name, point_set):
+            return None
+        return horizon_name
 
     def current_control_point_set(self) -> ControlPointSet | None:
-        if self.current_control_point_set_name is None:
+        horizon = self.current_horizon()
+        if horizon is None:
             return None
-        return self.control_point_sets[self.current_control_point_set_name]
+        return horizon.control_point_set
 
     def edit_current_control_point_set_master(self, master_index: int, delta_sample: float) -> bool:
+        return self.edit_current_control_point_set_masters(
+            [MasterMove(master_index=int(master_index), delta_sample=float(delta_sample))]
+        )
+
+    def edit_current_control_point_set_masters(self, moves: list[MasterMove]) -> bool:
         point_set = self.current_control_point_set()
         if point_set is None:
             return False
         source_attribute = self.attributes.get(point_set.source_attribute_name)
         if source_attribute is None:
             return False
-        point_set.points = apply_master_point_z_move(
+        point_set.points = apply_master_point_z_moves(
             point_set.points,
-            master_index,
-            delta_sample,
+            moves,
             source_attribute.volume_data,
         )
-        actor, polydata, sphere_source = create_control_point_actor(
+        (
+            actor,
+            polydata,
+            sphere_source,
+            master_actor,
+            master_polydata,
+            master_sphere_source,
+            selected_master_actor,
+            selected_master_polydata,
+            selected_master_sphere_source,
+        ) = create_control_point_actor(
             point_set.points,
             self.spacing,
             display_scale=point_set.display_scale,
         )
         point_set.actor.SetMapper(actor.GetMapper())
+        point_set.master_actor.SetMapper(master_actor.GetMapper())
+        point_set.selected_master_actor.SetMapper(selected_master_actor.GetMapper())
         point_set.sphere_source = sphere_source
         point_set.polydata = polydata
-        self.set_current_control_point_set(self.current_control_point_set_name, render=False)
+        point_set.master_sphere_source = master_sphere_source
+        point_set.master_polydata = master_polydata
+        point_set.selected_master_sphere_source = selected_master_sphere_source
+        point_set.selected_master_polydata = selected_master_polydata
+        current_horizon = self.current_horizon()
+        if current_horizon is None:
+            return False
+        if not self._apply_control_point_deformation_to_horizon(current_horizon.name, point_set):
+            return False
+        self.set_current_horizon(self.current_horizon_name, render=False)
         return True
 
-    def rebuild_current_horizon_from_control_points(self) -> str | None:
-        point_set = self.current_control_point_set()
-        if point_set is None:
-            return None
+    def _apply_control_point_deformation_to_horizon(self, horizon_name: str, point_set: ControlPointSet) -> bool:
+        horizon = self.horizons.get(horizon_name)
+        if horizon is None:
+            return False
         source_attribute = self.attributes.get(point_set.source_attribute_name)
         if source_attribute is None:
-            return None
+            self.last_rebuild_error = "Source attribute for the current control-point set is missing."
+            return False
         master_points = point_set.master_points
         if len(master_points) < 4:
-            return None
-        base_horizon = self.horizons.get(point_set.source_horizon_name)
-        if base_horizon is None:
-            return None
+            self.last_rebuild_error = "At least 4 master points are required to rebuild a horizon."
+            return False
+        rebuilt_mask = rebuild_mask_from_master_points(
+            source_attribute.volume_data.data.shape,
+            point_set.points,
+            point_set.original_horizon_mask,
+        )
+        if not np.any(rebuilt_mask):
+            self.last_rebuild_error = "Failed to rebuild a horizon mask from the current master points."
+            return False
         try:
-            actor, polydata, mapper, lut, scalar_range = create_horizon_surface_from_control_points(
-                master_points,
+            actor, polydata, mapper, lut, scalar_range = create_horizon_surface_actor(
+                rebuilt_mask,
+                source_attribute.volume_data.data,
                 self.spacing,
                 self.clip_percentile,
             )
-        except ValueError:
+        except ValueError as exc:
+            self.last_rebuild_error = str(exc)
+            return False
+
+        horizon.actor.SetMapper(actor.GetMapper())
+        horizon.polydata = polydata
+        horizon.mapper = mapper
+        horizon.lut = lut
+        horizon.scalar_range = scalar_range
+        horizon.component_mask = np.array(rebuilt_mask, copy=True)
+        horizon.voxel_count = int(np.count_nonzero(rebuilt_mask))
+        horizon.base_polydata = clone_polydata(polydata)
+        point_set.original_horizon_mask = np.array(rebuilt_mask, copy=True)
+        horizon.actor.SetVisibility(horizon.visible)
+        return True
+
+    def rebuild_current_horizon_from_control_points(self) -> str | None:
+        self.last_rebuild_error = None
+        point_set = self.current_control_point_set()
+        if point_set is None:
+            self.last_rebuild_error = "No control-point set is currently selected."
+            return None
+        source_attribute = self.attributes.get(point_set.source_attribute_name)
+        if source_attribute is None:
+            self.last_rebuild_error = "Source attribute for the current control-point set is missing."
+            return None
+        master_points = point_set.master_points
+        if len(master_points) < 4:
+            self.last_rebuild_error = "At least 4 master points are required to rebuild a horizon."
+            return None
+        base_horizon = self.horizons.get(point_set.source_horizon_name)
+        if base_horizon is None:
+            self.last_rebuild_error = "The source horizon for the current control-point set is missing."
+            return None
+        rebuilt_mask = rebuild_mask_from_master_points(
+            source_attribute.volume_data.data.shape,
+            point_set.points,
+            point_set.original_horizon_mask,
+        )
+        if not np.any(rebuilt_mask):
+            self.last_rebuild_error = "Failed to rebuild a horizon mask from the current master points."
+            return None
+        try:
+            actor, polydata, mapper, lut, scalar_range = create_horizon_surface_actor(
+                rebuilt_mask,
+                source_attribute.volume_data.data,
+                self.spacing,
+                self.clip_percentile,
+            )
+        except ValueError as exc:
+            self.last_rebuild_error = str(exc)
             return None
 
-        base_name = f"{point_set.name}_rebuilt_horizon"
-        new_name = base_name
-        suffix = 1
-        while new_name in self.horizons:
-            suffix += 1
-            new_name = f"{base_name}_{suffix}"
+        new_name = self._unique_name(self.horizons, f"{point_set.name}_rebuilt_horizon")
         horizon = HorizonSurface(
             name=new_name,
             actor=actor,
@@ -1083,17 +1461,191 @@ class SliceUpdater:
             polydata=polydata,
             lut=lut,
             component_index=base_horizon.component_index,
-            voxel_count=len(master_points),
+            voxel_count=int(np.count_nonzero(rebuilt_mask)),
             scalar_range=scalar_range,
             opacity=base_horizon.opacity,
             visible=True,
-            component_mask=np.array(point_set.original_horizon_mask, copy=True),
+            component_mask=np.array(rebuilt_mask, copy=True),
             source_attribute_name=source_attribute.name,
+            control_point_set=self._build_control_point_set(
+                name=f"{new_name}_control_points",
+                points=[ControlPoint(**vars(point)) for point in point_set.points],
+                horizon_name=new_name,
+                source_attribute_name=source_attribute.name,
+                source_horizon_name=new_name,
+                original_horizon_mask=np.array(rebuilt_mask, copy=True),
+                display_scale=point_set.display_scale,
+                link_radius=point_set.link_radius,
+                visible=point_set.visible,
+            ),
+            base_polydata=clone_polydata(polydata),
         )
         self.horizons[new_name] = horizon
         self.renderer.AddActor(actor)
+        self._add_control_point_actors(horizon.control_point_set)
         self.set_current_horizon(new_name, render=False)
         return new_name
+
+    def add_horizon(
+        self,
+        name: str,
+        *,
+        component_mask: np.ndarray,
+        source_attribute_name: str,
+        component_index: int = 0,
+        voxel_count: int | None = None,
+        opacity: float = 0.55,
+        visible: bool = True,
+        select: bool = False,
+    ) -> str:
+        source_attribute = self.attributes[source_attribute_name]
+        actor, polydata, mapper, lut, scalar_range = create_horizon_surface_actor(
+            np.asarray(component_mask, dtype=bool),
+            source_attribute.volume_data.data,
+            self.spacing,
+            self.clip_percentile,
+        )
+        new_name = self._unique_name(self.horizons, name)
+        horizon = HorizonSurface(
+            name=new_name,
+            actor=actor,
+            mapper=mapper,
+            polydata=polydata,
+            lut=lut,
+            component_index=int(component_index),
+            voxel_count=int(np.count_nonzero(component_mask) if voxel_count is None else voxel_count),
+            scalar_range=scalar_range,
+            opacity=float(opacity),
+            visible=bool(visible),
+            component_mask=np.array(component_mask, copy=True),
+            source_attribute_name=source_attribute_name,
+            control_point_set=None,
+            base_polydata=clone_polydata(polydata),
+        )
+        self.horizons[new_name] = horizon
+        self.renderer.AddActor(actor)
+        self.set_current_horizon(new_name if select else self.current_horizon_name, render=False)
+        return new_name
+
+    def _build_control_point_set(
+        self,
+        name: str,
+        *,
+        points: list[ControlPoint],
+        horizon_name: str,
+        source_attribute_name: str,
+        source_horizon_name: str,
+        original_horizon_mask: np.ndarray,
+        display_scale: float = 1.0,
+        link_radius: float | None = None,
+        visible: bool = True,
+    ) -> ControlPointSet:
+        (
+            actor,
+            polydata,
+            sphere_source,
+            master_actor,
+            master_polydata,
+            master_sphere_source,
+            selected_master_actor,
+            selected_master_polydata,
+            selected_master_sphere_source,
+        ) = create_control_point_actor(
+            points,
+            self.spacing,
+            display_scale=display_scale,
+        )
+        return ControlPointSet(
+            name=name,
+            actor=actor,
+            sphere_source=sphere_source,
+            polydata=polydata,
+            master_actor=master_actor,
+            master_sphere_source=master_sphere_source,
+            master_polydata=master_polydata,
+            selected_master_actor=selected_master_actor,
+            selected_master_sphere_source=selected_master_sphere_source,
+            selected_master_polydata=selected_master_polydata,
+            points=list(points),
+            horizon_name=horizon_name,
+            source_attribute_name=source_attribute_name,
+            source_horizon_name=source_horizon_name,
+            original_horizon_mask=np.array(original_horizon_mask, copy=True),
+            display_scale=float(display_scale),
+            link_radius=float(
+                (8.0 * min(self.spacing.xline, self.spacing.inline)) if link_radius is None else link_radius
+            ),
+            visible=bool(visible),
+        )
+
+    def _add_control_point_actors(self, point_set: ControlPointSet | None) -> None:
+        if point_set is None:
+            return
+        self.renderer.AddActor(point_set.actor)
+        self.renderer.AddActor(point_set.master_actor)
+        self.renderer.AddActor(point_set.selected_master_actor)
+
+    def _remove_control_point_actors(self, point_set: ControlPointSet | None) -> None:
+        if point_set is None:
+            return
+        self.renderer.RemoveActor(point_set.actor)
+        self.renderer.RemoveActor(point_set.master_actor)
+        self.renderer.RemoveActor(point_set.selected_master_actor)
+
+    def set_control_points_for_horizon(
+        self,
+        horizon_name: str,
+        *,
+        points: list[ControlPoint],
+        source_attribute_name: str,
+        source_horizon_name: str,
+        original_horizon_mask: np.ndarray,
+        display_scale: float = 1.0,
+        link_radius: float | None = None,
+        visible: bool = True,
+    ) -> str:
+        horizon = self.horizons[horizon_name]
+        self._remove_control_point_actors(horizon.control_point_set)
+        horizon.control_point_set = self._build_control_point_set(
+            name=f"{horizon.name}_control_points",
+            points=points,
+            horizon_name=horizon.name,
+            source_attribute_name=source_attribute_name,
+            source_horizon_name=source_horizon_name,
+            original_horizon_mask=original_horizon_mask,
+            display_scale=display_scale,
+            link_radius=link_radius,
+            visible=visible,
+        )
+        self._add_control_point_actors(horizon.control_point_set)
+        self.set_current_horizon(horizon_name, render=False)
+        return horizon_name
+
+    def remove_attribute(self, name: str) -> bool:
+        if name not in self.attributes or len(self.attributes) <= 1:
+            return False
+        was_current = self.current_attribute_name == name
+        del self.attributes[name]
+        if was_current:
+            next_name = next(iter(self.attributes), None)
+            if next_name is None:
+                self.current_attribute_name = None
+                self._sync_axes_from_current_attribute()
+                self.update_overlay()
+            else:
+                self.set_attribute(next_name, render=False)
+        return True
+
+    def remove_horizon(self, name: str) -> bool:
+        horizon = self.horizons.pop(name, None)
+        if horizon is None:
+            return False
+        self._remove_control_point_actors(horizon.control_point_set)
+        self.renderer.RemoveActor(horizon.actor)
+        if self.current_horizon_name == name:
+            next_name = next(iter(self.horizons), None)
+            self.set_current_horizon(next_name, render=False)
+        return True
 
     def current_control_point_display_scale(self) -> float | None:
         point_set = self.current_control_point_set()
@@ -1101,19 +1653,44 @@ class SliceUpdater:
             return None
         return float(point_set.display_scale)
 
+    def current_control_point_link_radius(self) -> float | None:
+        point_set = self.current_control_point_set()
+        if point_set is None:
+            return None
+        return float(point_set.link_radius)
+
     def set_control_point_display_scale(self, scale: float, render: bool = True) -> None:
         point_set = self.current_control_point_set()
         if point_set is None:
             return
-        point_set.display_scale = max(0.2, min(5.0, float(scale)))
-        radius = max(
+        point_set.display_scale = max(0.4, min(8.0, float(scale)))
+        base_radius = max(
             min(self.spacing.xline, self.spacing.inline, self.spacing.sample)
-            * 0.18
+            * 0.28
             * point_set.display_scale,
-            1.5,
+            2.0,
         )
-        point_set.sphere_source.SetRadius(radius)
+        master_radius = max(
+            min(self.spacing.xline, self.spacing.inline, self.spacing.sample)
+            * 0.44
+            * point_set.display_scale,
+            3.0,
+        )
+        point_set.sphere_source.SetRadius(base_radius)
         point_set.sphere_source.Update()
+        point_set.master_sphere_source.SetRadius(master_radius)
+        point_set.master_sphere_source.Update()
+        point_set.selected_master_sphere_source.SetRadius(master_radius * 1.3)
+        point_set.selected_master_sphere_source.Update()
+        if render:
+            self.interactor.GetRenderWindow().Render()
+
+    def set_control_point_link_radius(self, radius: float, render: bool = True) -> None:
+        point_set = self.current_control_point_set()
+        if point_set is None:
+            return
+        min_spacing = min(self.spacing.xline, self.spacing.inline)
+        point_set.link_radius = max(min_spacing, float(radius))
         if render:
             self.interactor.GetRenderWindow().Render()
 
@@ -1152,10 +1729,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         vtk_widget: QVTKRenderWindowInteractor,
         render_window: vtk.vtkRenderWindow,
         renderer: vtk.vtkRenderer,
-        image: vtk.vtkImageData,
-        xlines: np.ndarray,
-        inlines: np.ndarray,
-        samples: np.ndarray,
+        outline_actor: vtk.vtkActor,
+        axis_texts: list[vtk.vtkBillboardTextActor3D],
         debug_ui: bool,
     ) -> None:
         super().__init__()
@@ -1163,13 +1738,20 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.vtk_widget = vtk_widget
         self.render_window = render_window
         self.renderer = renderer
-        self.image = image
+        self.image = updater.image
+        self.outline_actor = outline_actor
+        self.axis_texts = axis_texts
         self.debug_ui = debug_ui
         self._vtk_initialized = False
         self._render_pending = False
+        self._selected_master_point_index: int | None = None
+        self._linked_master_point_indices: set[int] = set()
+        self._prop_picker = vtk.vtkPropPicker()
+        self.data_panel = DataPanelWidget(self)
+        self._selected_data_item: tuple[str, str] | None = None
 
         self.setWindowTitle(APP_NAME)
-        self.resize(2200, 1400)
+        self.resize(1920, 1400)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -1178,43 +1760,9 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
 
-        data_panel = QtWidgets.QWidget()
-        data_panel.setMinimumWidth(280)
-        data_panel.setMaximumWidth(360)
-        data_layout = QtWidgets.QVBoxLayout(data_panel)
-
-        data_header = QtWidgets.QLabel("Data")
-        data_header_font = QtGui.QFont()
-        data_header_font.setPointSize(18)
-        data_header_font.setBold(True)
-        data_header.setFont(data_header_font)
-        data_layout.addWidget(data_header)
-
-        seismic_group = QtWidgets.QGroupBox("Seismic")
-        seismic_layout = QtWidgets.QVBoxLayout(seismic_group)
-        self.seismic_list = QtWidgets.QListWidget()
-        seismic_layout.addWidget(self.seismic_list)
-        data_layout.addWidget(seismic_group)
-
-        attributes_group = QtWidgets.QGroupBox("Attributes")
-        attributes_layout = QtWidgets.QVBoxLayout(attributes_group)
-        self.attributes_list = QtWidgets.QListWidget()
-        attributes_layout.addWidget(self.attributes_list)
-        data_layout.addWidget(attributes_group)
-
-        horizons_group = QtWidgets.QGroupBox("Horizons")
-        horizons_layout = QtWidgets.QVBoxLayout(horizons_group)
-        self.horizons_list = QtWidgets.QListWidget()
-        horizons_layout.addWidget(self.horizons_list)
-        data_layout.addWidget(horizons_group)
-
-        wells_group = QtWidgets.QGroupBox("Control Points")
-        wells_layout = QtWidgets.QVBoxLayout(wells_group)
-        self.control_points_list = QtWidgets.QListWidget()
-        wells_layout.addWidget(self.control_points_list)
-        data_layout.addWidget(wells_group)
-        data_layout.addStretch(1)
-        layout.addWidget(data_panel, stretch=0)
+        self.data_panel.setMinimumWidth(300)
+        self.data_panel.setMaximumWidth(380)
+        layout.addWidget(self.data_panel, stretch=0)
 
         viewer_panel = QtWidgets.QWidget()
         viewer_layout = QtWidgets.QVBoxLayout(viewer_panel)
@@ -1234,128 +1782,158 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         panel.setMaximumWidth(360)
         layout.addWidget(panel, stretch=0)
         panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(8)
 
-        header = QtWidgets.QLabel("Operations")
-        header_font = QtGui.QFont()
-        header_font.setPointSize(18)
-        header_font.setBold(True)
-        header.setFont(header_font)
-        panel_layout.addWidget(header)
+        self.load_seismic_button = QtWidgets.QPushButton("Load Seismic Data")
+        self.load_seismic_button.clicked.connect(self.open_load_seismic_dialog)
+        panel_layout.addWidget(self.load_seismic_button)
 
-        self.info_label = QtWidgets.QLabel("")
-        info_font = QtGui.QFont("Menlo")
-        info_font.setPointSize(11)
-        self.info_label.setFont(info_font)
-        self.info_label.setWordWrap(True)
-        panel_layout.addWidget(self.info_label)
+        self.extract_button = QtWidgets.QPushButton("Open Range Extraction")
+        self.extract_button.clicked.connect(self.open_extract_range_dialog)
+        panel_layout.addWidget(self.extract_button)
 
-        note = QtWidgets.QLabel(
-            "Use the controls below to move slices, switch attributes,\n"
-            "extract value ranges, build horizon envelopes, and reset the view."
-        )
-        note.setWordWrap(True)
-        panel_layout.addWidget(note)
+        self.extract_envelope_button = QtWidgets.QPushButton("Open Horizon Extraction")
+        self.extract_envelope_button.clicked.connect(self.open_extract_horizon_dialog)
+        panel_layout.addWidget(self.extract_envelope_button)
 
-        self.reset_view_button = QtWidgets.QPushButton("Reset View")
-        self.reset_view_button.clicked.connect(self.reset_view)
-        panel_layout.addWidget(self.reset_view_button)
+        self.extract_control_points_button = QtWidgets.QPushButton("Extract Control Point")
+        self.extract_control_points_button.clicked.connect(self.open_extract_control_points_dialog)
+        panel_layout.addWidget(self.extract_control_points_button)
 
         attribute_display_group = QtWidgets.QGroupBox("Attribute Display")
-        attribute_display_layout = QtWidgets.QGridLayout(attribute_display_group)
-        attribute_display_layout.addWidget(QtWidgets.QLabel("Min"), 0, 0)
-        attribute_display_layout.addWidget(QtWidgets.QLabel("Max"), 1, 0)
+        attribute_display_layout = QtWidgets.QVBoxLayout(attribute_display_group)
+        attribute_display_layout.setContentsMargins(8, 6, 8, 6)
+        attribute_display_layout.setSpacing(6)
+        attribute_display_row = QtWidgets.QHBoxLayout()
+        attribute_display_row.setSpacing(6)
+        attribute_display_row.addWidget(QtWidgets.QLabel("Min"))
         self.attribute_display_min_edit = QtWidgets.QLineEdit()
+        self.attribute_display_min_edit.setMaximumWidth(72)
+        attribute_display_row.addWidget(self.attribute_display_min_edit)
+        attribute_display_row.addWidget(QtWidgets.QLabel("Max"))
         self.attribute_display_max_edit = QtWidgets.QLineEdit()
+        self.attribute_display_max_edit.setMaximumWidth(72)
         range_validator = QtGui.QDoubleValidator()
         self.attribute_display_min_edit.setValidator(range_validator)
         self.attribute_display_max_edit.setValidator(range_validator)
-        attribute_display_layout.addWidget(self.attribute_display_min_edit, 0, 1)
-        attribute_display_layout.addWidget(self.attribute_display_max_edit, 1, 1)
+        attribute_display_row.addWidget(self.attribute_display_max_edit)
         self.apply_attribute_display_button = QtWidgets.QPushButton("Apply Attribute Display")
+        self.apply_attribute_display_button.setMaximumWidth(78)
         self.apply_attribute_display_button.clicked.connect(self.apply_attribute_display)
-        attribute_display_layout.addWidget(self.apply_attribute_display_button, 2, 0, 1, 2)
-        attribute_display_layout.addWidget(QtWidgets.QLabel("Opacity"), 3, 0)
+        attribute_display_row.addWidget(self.apply_attribute_display_button)
+        attribute_display_layout.addLayout(attribute_display_row)
+
+        attribute_opacity_row = QtWidgets.QHBoxLayout()
+        attribute_opacity_row.setSpacing(6)
+        attribute_opacity_row.addWidget(QtWidgets.QLabel("Opacity"))
         self.attribute_opacity_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.attribute_opacity_slider.setRange(0, 100)
         self.attribute_opacity_slider.valueChanged.connect(self.change_attribute_opacity)
-        attribute_display_layout.addWidget(self.attribute_opacity_slider, 3, 1)
+        attribute_opacity_row.addWidget(self.attribute_opacity_slider, stretch=1)
+        attribute_display_layout.addLayout(attribute_opacity_row)
         panel_layout.addWidget(attribute_display_group)
 
-        range_group = QtWidgets.QGroupBox("Extract Range")
-        range_layout = QtWidgets.QVBoxLayout(range_group)
-        self.extract_button = QtWidgets.QPushButton("Open Range Extraction")
-        self.extract_button.clicked.connect(self.open_extract_range_dialog)
-        range_layout.addWidget(self.extract_button)
-        panel_layout.addWidget(range_group)
-
-        envelope_group = QtWidgets.QGroupBox("Extract Horizon Envelopes")
-        envelope_layout = QtWidgets.QVBoxLayout(envelope_group)
-        self.extract_envelope_button = QtWidgets.QPushButton("Open Horizon Extraction")
-        self.extract_envelope_button.clicked.connect(self.open_extract_horizon_dialog)
-        envelope_layout.addWidget(self.extract_envelope_button)
-        panel_layout.addWidget(envelope_group)
-
-        control_points_group = QtWidgets.QGroupBox("Extract Control Points")
-        control_points_layout = QtWidgets.QVBoxLayout(control_points_group)
-        self.extract_control_points_button = QtWidgets.QPushButton("Open Control Point Extraction")
-        self.extract_control_points_button.clicked.connect(self.open_extract_control_points_dialog)
-        control_points_layout.addWidget(self.extract_control_points_button)
-        self.edit_master_point_button = QtWidgets.QPushButton("Edit Master Point")
-        self.edit_master_point_button.clicked.connect(self.open_edit_master_point_dialog)
-        control_points_layout.addWidget(self.edit_master_point_button)
-        self.rebuild_horizon_button = QtWidgets.QPushButton("Rebuild Horizon from Control Points")
-        self.rebuild_horizon_button.clicked.connect(self.rebuild_horizon_from_control_points)
-        control_points_layout.addWidget(self.rebuild_horizon_button)
-        control_points_layout.addWidget(QtWidgets.QLabel("Control Point Display Size"))
-        self.control_point_size_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.control_point_size_slider.setRange(20, 300)
-        self.control_point_size_slider.valueChanged.connect(self.change_control_point_size)
-        control_points_layout.addWidget(self.control_point_size_slider)
-        panel_layout.addWidget(control_points_group)
-
         horizon_display_group = QtWidgets.QGroupBox("Horizon Display")
-        horizon_display_layout = QtWidgets.QGridLayout(horizon_display_group)
-        horizon_display_layout.addWidget(QtWidgets.QLabel("Min"), 0, 0)
-        horizon_display_layout.addWidget(QtWidgets.QLabel("Max"), 1, 0)
+        horizon_display_layout = QtWidgets.QVBoxLayout(horizon_display_group)
+        horizon_display_layout.setContentsMargins(8, 6, 8, 6)
+        horizon_display_layout.setSpacing(6)
+        horizon_display_row = QtWidgets.QHBoxLayout()
+        horizon_display_row.setSpacing(6)
+        horizon_display_row.addWidget(QtWidgets.QLabel("Min"))
         self.horizon_display_min_edit = QtWidgets.QLineEdit()
+        self.horizon_display_min_edit.setMaximumWidth(72)
+        horizon_display_row.addWidget(self.horizon_display_min_edit)
+        horizon_display_row.addWidget(QtWidgets.QLabel("Max"))
         self.horizon_display_max_edit = QtWidgets.QLineEdit()
+        self.horizon_display_max_edit.setMaximumWidth(72)
         self.horizon_display_min_edit.setValidator(range_validator)
         self.horizon_display_max_edit.setValidator(range_validator)
-        horizon_display_layout.addWidget(self.horizon_display_min_edit, 0, 1)
-        horizon_display_layout.addWidget(self.horizon_display_max_edit, 1, 1)
+        horizon_display_row.addWidget(self.horizon_display_max_edit)
         self.apply_horizon_display_button = QtWidgets.QPushButton("Apply Horizon Display")
+        self.apply_horizon_display_button.setMaximumWidth(78)
         self.apply_horizon_display_button.clicked.connect(self.apply_horizon_display)
-        horizon_display_layout.addWidget(self.apply_horizon_display_button, 2, 0, 1, 2)
-        horizon_display_layout.addWidget(QtWidgets.QLabel("Opacity"), 3, 0)
+        horizon_display_row.addWidget(self.apply_horizon_display_button)
+        horizon_display_layout.addLayout(horizon_display_row)
+
+        horizon_opacity_row = QtWidgets.QHBoxLayout()
+        horizon_opacity_row.setSpacing(6)
+        horizon_opacity_row.addWidget(QtWidgets.QLabel("Opacity"))
         self.horizon_opacity_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.horizon_opacity_slider.setRange(0, 100)
         self.horizon_opacity_slider.valueChanged.connect(self.change_horizon_opacity)
-        horizon_display_layout.addWidget(self.horizon_opacity_slider, 3, 1)
+        horizon_opacity_row.addWidget(self.horizon_opacity_slider, stretch=1)
+        horizon_display_layout.addLayout(horizon_opacity_row)
         panel_layout.addWidget(horizon_display_group)
 
-        self.xline_control = AxisControl("Crossline", xlines)
-        self.inline_control = AxisControl("Inline", inlines)
-        self.sample_control = AxisControl("Sample", samples)
+        self.xline_control = AxisControl("Crossline", np.asarray([0.0], dtype=np.float32))
+        self.inline_control = AxisControl("Inline", np.asarray([0.0], dtype=np.float32))
+        self.sample_control = AxisControl("Sample", np.asarray([0.0], dtype=np.float32))
         panel_layout.addWidget(self.xline_control)
         panel_layout.addWidget(self.inline_control)
         panel_layout.addWidget(self.sample_control)
+
+        control_point_tools_group = QtWidgets.QGroupBox("Control Point Tools")
+        control_point_tools_layout = QtWidgets.QVBoxLayout(control_point_tools_group)
+        control_point_tools_layout.setContentsMargins(8, 6, 8, 6)
+        control_point_tools_layout.setSpacing(6)
+        control_point_tools_row = QtWidgets.QHBoxLayout()
+        control_point_tools_row.setSpacing(6)
+        self.selected_master_label = QtWidgets.QLabel("Master: none")
+        self.selected_master_label.setMinimumWidth(86)
+        control_point_tools_row.addWidget(self.selected_master_label)
+        self.edit_master_point_button = QtWidgets.QPushButton("Edit")
+        self.edit_master_point_button.clicked.connect(self.open_edit_master_point_dialog)
+        control_point_tools_row.addWidget(self.edit_master_point_button)
+        self.rebuild_horizon_button = QtWidgets.QPushButton("Rebuild")
+        self.rebuild_horizon_button.clicked.connect(self.rebuild_horizon_from_control_points)
+        control_point_tools_row.addWidget(self.rebuild_horizon_button)
+        self.move_master_up_button = QtWidgets.QPushButton("Z+")
+        self.move_master_up_button.clicked.connect(lambda: self.move_selected_master_point(1.0))
+        control_point_tools_row.addWidget(self.move_master_up_button)
+        self.move_master_down_button = QtWidgets.QPushButton("Z-")
+        self.move_master_down_button.clicked.connect(lambda: self.move_selected_master_point(-1.0))
+        control_point_tools_row.addWidget(self.move_master_down_button)
+        control_point_tools_layout.addLayout(control_point_tools_row)
+
+        control_point_size_row = QtWidgets.QHBoxLayout()
+        control_point_size_row.setSpacing(6)
+        control_point_size_row.addWidget(QtWidgets.QLabel("Size"))
+        self.control_point_size_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.control_point_size_slider.setRange(40, 800)
+        self.control_point_size_slider.valueChanged.connect(self.change_control_point_size)
+        control_point_size_row.addWidget(self.control_point_size_slider, stretch=1)
+        control_point_tools_layout.addLayout(control_point_size_row)
+
+        control_point_link_row = QtWidgets.QHBoxLayout()
+        control_point_link_row.setSpacing(6)
+        control_point_link_row.addWidget(QtWidgets.QLabel("Link Radius"))
+        self.control_point_link_radius_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.control_point_link_radius_slider.setRange(1, 120)
+        self.control_point_link_radius_slider.valueChanged.connect(self.change_control_point_link_radius)
+        control_point_link_row.addWidget(self.control_point_link_radius_slider, stretch=1)
+        control_point_tools_layout.addLayout(control_point_link_row)
+        panel_layout.addWidget(control_point_tools_group)
+
         panel_layout.addStretch(1)
+
+        self.reset_view_button = QtWidgets.QPushButton("Reset")
+        self.reset_view_button.clicked.connect(self.reset_view)
+        panel_layout.addWidget(self.reset_view_button)
 
         self.xline_control.value_changed.connect(lambda index: self._set_index("xline", index))
         self.inline_control.value_changed.connect(lambda index: self._set_index("inline", index))
         self.sample_control.value_changed.connect(lambda index: self._set_index("sample", index))
-        self.attributes_list.currentTextChanged.connect(self.change_attribute)
-        self.horizons_list.currentItemChanged.connect(self.change_horizon)
-        self.horizons_list.itemChanged.connect(self.toggle_horizon_visibility)
-        self.control_points_list.currentItemChanged.connect(self.change_control_point_set)
-        self.control_points_list.itemChanged.connect(self.toggle_control_point_set_visibility)
+        self.data_panel.item_activated.connect(self.activate_data_item)
+        self.data_panel.category_load_requested.connect(self.load_data_for_category)
+        self.data_panel.item_store_requested.connect(self.store_data_item)
+        self.data_panel.item_unload_requested.connect(self.unload_data_item)
 
-        self.seismic_list.addItem("Seismic")
-        self.refresh_attributes()
-        self.refresh_horizons()
-        self.refresh_control_points()
+        self.refresh_axis_controls()
+        self.refresh_data_panel()
         self.refresh_info()
         self.refresh_display_controls()
+        self.vtk_widget.installEventFilter(self)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
@@ -1373,6 +1951,43 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.render_window.Render()
         debug_log(self.debug_ui, "embedded vtk render completed")
 
+    def _is_shift_pressed(self) -> bool:
+        modifiers = QtWidgets.QApplication.keyboardModifiers()
+        return bool(modifiers & QtCore.Qt.KeyboardModifier.ShiftModifier)
+
+    def _is_ctrl_pressed(self) -> bool:
+        modifiers = QtWidgets.QApplication.keyboardModifiers()
+        return bool(modifiers & QtCore.Qt.KeyboardModifier.ControlModifier)
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if watched is self.vtk_widget:
+            if (
+                event.type() == QtCore.QEvent.Type.MouseButtonPress
+                and isinstance(event, QtGui.QMouseEvent)
+                and event.button() == QtCore.Qt.MouseButton.LeftButton
+            ):
+                if self.pick_master_control_point(
+                    int(event.position().x()),
+                    int(event.position().y()),
+                    toggle_linked=self._is_ctrl_pressed(),
+                ):
+                    self.schedule_render()
+                    return True
+            if (
+                event.type() == QtCore.QEvent.Type.Wheel
+                and isinstance(event, QtGui.QWheelEvent)
+                and self._selected_master_point_index is not None
+                and self._is_shift_pressed()
+            ):
+                delta = event.angleDelta().y()
+                if delta > 0:
+                    self.move_selected_master_point(1.0)
+                    return True
+                if delta < 0:
+                    self.move_selected_master_point(-1.0)
+                    return True
+        return super().eventFilter(watched, event)
+
     def schedule_render(self) -> None:
         if self._render_pending:
             return
@@ -1384,6 +1999,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.render_window.Render()
 
     def reset_view(self) -> None:
+        if not self.updater.has_attribute_data():
+            return
         configure_default_camera(self.renderer, self.image)
         self.schedule_render()
         debug_log(self.debug_ui, "camera reset to default view")
@@ -1394,14 +2011,48 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.schedule_render()
 
     def refresh_info(self) -> None:
-        self.info_label.setText(self.updater.current_text())
+        return
+
+    def refresh_axis_controls(self) -> None:
+        self.xline_control.set_values(self.updater.xlines, self.updater.indices["xline"])
+        self.inline_control.set_values(self.updater.inlines, self.updater.indices["inline"])
+        self.sample_control.set_values(self.updater.samples, self.updater.indices["sample"])
+
+    def refresh_scene_guides(self) -> None:
+        if self.outline_actor is not None:
+            self.renderer.RemoveActor(self.outline_actor)
+        for actor in self.axis_texts:
+            self.renderer.RemoveActor(actor)
+        self.outline_actor = create_outline(self.updater.image)
+        self.axis_texts = create_axis_labels(
+            self.updater.image,
+            self.updater.xlines,
+            self.updater.inlines,
+            self.updater.samples,
+            self.updater.spacing.xline,
+            self.updater.spacing.inline,
+            self.updater.spacing.sample,
+        )
+        self.renderer.AddActor(self.outline_actor)
+        for actor in self.axis_texts:
+            self.renderer.AddActor(actor)
 
     def refresh_display_controls(self) -> None:
-        attr_min, attr_max = self.updater.current_attribute_display_range()
-        if not self.attribute_display_min_edit.hasFocus():
-            self.attribute_display_min_edit.setText(format_value(attr_min))
-        if not self.attribute_display_max_edit.hasFocus():
-            self.attribute_display_max_edit.setText(format_value(attr_max))
+        attribute_range = self.updater.current_attribute_display_range()
+        has_attribute = attribute_range is not None
+        self.attribute_display_min_edit.setEnabled(has_attribute)
+        self.attribute_display_max_edit.setEnabled(has_attribute)
+        self.apply_attribute_display_button.setEnabled(has_attribute)
+        self.attribute_opacity_slider.setEnabled(has_attribute)
+        if has_attribute:
+            attr_min, attr_max = attribute_range
+            if not self.attribute_display_min_edit.hasFocus():
+                self.attribute_display_min_edit.setText(format_value(attr_min))
+            if not self.attribute_display_max_edit.hasFocus():
+                self.attribute_display_max_edit.setText(format_value(attr_max))
+        else:
+            self.attribute_display_min_edit.clear()
+            self.attribute_display_max_edit.clear()
         self.attribute_opacity_slider.blockSignals(True)
         self.attribute_opacity_slider.setValue(int(round(self.updater.current_attribute_opacity() * 100.0)))
         self.attribute_opacity_slider.blockSignals(False)
@@ -1432,113 +2083,594 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.edit_master_point_button.setEnabled(has_control_points)
         self.rebuild_horizon_button.setEnabled(has_control_points)
         self.control_point_size_slider.setEnabled(has_control_points)
+        self.control_point_link_radius_slider.setEnabled(has_control_points)
+        has_selected_master = has_control_points and self._selected_master_point_index is not None
+        self.move_master_up_button.setEnabled(has_selected_master)
+        self.move_master_down_button.setEnabled(has_selected_master)
+        if has_selected_master:
+            linked_count = len(self._linked_master_point_indices)
+            self.selected_master_label.setText(f"Master: #{self._selected_master_point_index} (+{linked_count})")
+        else:
+            self.selected_master_label.setText("Master: none")
         control_point_scale = self.updater.current_control_point_display_scale()
         self.control_point_size_slider.blockSignals(True)
         self.control_point_size_slider.setValue(
             int(round((1.0 if control_point_scale is None else control_point_scale) * 100.0))
         )
         self.control_point_size_slider.blockSignals(False)
+        link_radius = self.updater.current_control_point_link_radius()
+        min_spacing = min(self.updater.spacing.xline, self.updater.spacing.inline)
+        self.control_point_link_radius_slider.blockSignals(True)
+        self.control_point_link_radius_slider.setValue(
+            int(round((min_spacing if link_radius is None else link_radius) / max(min_spacing, 1e-6)))
+        )
+        self.control_point_link_radius_slider.blockSignals(False)
 
-    def refresh_attributes(self) -> None:
-        selected = self.updater.current_attribute_name
-        self.attributes_list.blockSignals(True)
-        self.attributes_list.clear()
-        self.attributes_list.addItems(self.updater.attribute_names())
-        items = self.attributes_list.findItems(selected, QtCore.Qt.MatchFlag.MatchExactly)
-        if items:
-            self.attributes_list.setCurrentItem(items[0])
-        self.attributes_list.blockSignals(False)
+        self.extract_button.setEnabled(has_attribute)
+        self.extract_envelope_button.setEnabled(has_attribute)
+        self.reset_view_button.setEnabled(has_attribute)
 
-    def refresh_horizons(self) -> None:
-        selected = self.updater.current_horizon_name
-        self.horizons_list.blockSignals(True)
-        self.horizons_list.clear()
-        for name in self.updater.horizon_names():
-            item = QtWidgets.QListWidgetItem(name)
-            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable)
-            item.setCheckState(
-                QtCore.Qt.CheckState.Checked
-                if self.updater.horizons[name].visible
-                else QtCore.Qt.CheckState.Unchecked
-            )
-            self.horizons_list.addItem(item)
-            if name == selected:
-                self.horizons_list.setCurrentItem(item)
-        self.horizons_list.blockSignals(False)
+    def refresh_data_panel(self) -> None:
+        seismic_items: list[DataPanelItem] = []
+        attribute_items: list[DataPanelItem] = []
+        for name, attribute in self.updater.attributes.items():
+            panel_category = attribute.volume_data.metadata.get("panel_category", "seismic" if name == "seismic" else "attribute")
+            entry = DataPanelItem(category=str(panel_category), name=name, label=name)
+            if panel_category == "seismic":
+                seismic_items.append(entry)
+            else:
+                attribute_items.append(entry)
+        items = {
+            "seismic": seismic_items,
+            "attribute": attribute_items,
+            "horizon": [
+                DataPanelItem(
+                    category="horizon",
+                    name=name,
+                    label=(
+                        f"{name} ({self.updater.horizons[name].voxel_count} voxels"
+                        f", {0 if self.updater.horizons[name].control_point_set is None else len(self.updater.horizons[name].control_point_set.points)} pts)"
+                    ),
+                )
+                for name in self.updater.horizon_names()
+            ],
+            "well": [],
+        }
+        self.data_panel.set_items(items)
+        if self._selected_data_item is not None:
+            selected_category, selected_name = self._selected_data_item
+            self.data_panel.select_item(selected_category, selected_name)
         self.refresh_display_controls()
 
-    def refresh_control_points(self) -> None:
-        selected = self.updater.current_control_point_set_name
-        self.control_points_list.blockSignals(True)
-        self.control_points_list.clear()
-        for name in self.updater.control_point_set_names():
-            point_set = self.updater.control_point_sets[name]
-            label = f"{name} ({len(point_set.points)} pts, {len(point_set.master_points)} masters)"
-            item = QtWidgets.QListWidgetItem(label)
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
-            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsSelectable)
-            item.setCheckState(
-                QtCore.Qt.CheckState.Checked
-                if point_set.visible
-                else QtCore.Qt.CheckState.Unchecked
-            )
-            self.control_points_list.addItem(item)
-            if name == selected:
-                self.control_points_list.setCurrentItem(item)
-        self.control_points_list.blockSignals(False)
-
-    def change_attribute(self, name: str) -> None:
-        if not name:
-            return
-        self.updater.set_attribute(name, render=False)
-        self.image = self.updater.image
+    def activate_data_item(self, category: str, name: str) -> None:
+        self._selected_data_item = (category, name)
+        if category in {"seismic", "attribute"}:
+            self.updater.set_attribute(name, render=False)
+            self.image = self.updater.image
+            self.refresh_axis_controls()
+            self.refresh_scene_guides()
+        elif category == "horizon":
+            self.updater.set_current_horizon(name, render=False)
+            self._selected_master_point_index = None
+            self._linked_master_point_indices.clear()
+            self._refresh_selected_master_actor()
         self.refresh_info()
-        self.refresh_display_controls()
+        self.refresh_data_panel()
         self.schedule_render()
 
-    def change_horizon(
-        self,
-        current: QtWidgets.QListWidgetItem | None,
-        previous: QtWidgets.QListWidgetItem | None,
-    ) -> None:
-        del previous
-        name = None if current is None else current.text()
-        self.updater.set_current_horizon(name, render=False)
-        self.refresh_display_controls()
-        self.schedule_render()
+    def pick_master_control_point(self, display_x: int, display_y: int, *, toggle_linked: bool = False) -> bool:
+        point_set = self.updater.current_control_point_set()
+        if point_set is None or not point_set.visible:
+            self._selected_master_point_index = None
+            self._linked_master_point_indices.clear()
+            self._refresh_selected_master_actor()
+            self.refresh_display_controls()
+            return False
 
-    def toggle_horizon_visibility(self, item: QtWidgets.QListWidgetItem) -> None:
-        self.updater.set_horizon_visibility(
-            item.text(),
-            item.checkState() == QtCore.Qt.CheckState.Checked,
-            render=False,
+        vtk_display_x, vtk_display_y = self._qt_to_vtk_display(display_x, display_y)
+        picked_actor = None
+        if self._prop_picker.Pick(float(vtk_display_x), float(vtk_display_y), 0.0, self.renderer) != 0:
+            picked_actor = self._prop_picker.GetActor()
+            if picked_actor not in {point_set.master_actor, point_set.selected_master_actor}:
+                picked_actor = None
+
+        selected_master: ControlPoint | None = None
+        best_distance2 = float("inf")
+        for point in point_set.master_points:
+            world_x = float(point.xline_index) * float(self.updater.spacing.xline)
+            world_y = float(point.inline_index) * float(self.updater.spacing.inline)
+            world_z = float(point.sample_index) * float(self.updater.spacing.sample)
+            self.renderer.SetWorldPoint(world_x, world_y, world_z, 1.0)
+            self.renderer.WorldToDisplay()
+            display_point = self.renderer.GetDisplayPoint()
+            distance2 = (float(display_point[0]) - float(vtk_display_x)) ** 2 + (
+                float(display_point[1]) - float(vtk_display_y)
+            ) ** 2
+            if distance2 < best_distance2:
+                best_distance2 = distance2
+                selected_master = point
+
+        threshold2 = 36.0 * 36.0 if picked_actor is not None else 22.0 * 22.0
+        if selected_master is None or selected_master.master_index is None or best_distance2 > threshold2:
+            return False
+
+        selected_master_index = int(selected_master.master_index)
+        if toggle_linked and self._selected_master_point_index is not None:
+            if selected_master_index != self._selected_master_point_index:
+                selected_main = point_set.master_point_by_index(self._selected_master_point_index)
+                if selected_main is not None:
+                    selected_column = (int(selected_main.xline_index), int(selected_main.inline_index))
+                    target_column = (int(selected_master.xline_index), int(selected_master.inline_index))
+                    if target_column != selected_column:
+                        same_column_indices = {
+                            int(point.master_index)
+                            for point in point_set.master_points
+                            if point.master_index is not None
+                            and int(point.xline_index) == target_column[0]
+                            and int(point.inline_index) == target_column[1]
+                        }
+                        if selected_master_index in self._linked_master_point_indices:
+                            self._linked_master_point_indices.discard(selected_master_index)
+                        else:
+                            self._linked_master_point_indices.difference_update(same_column_indices)
+                            self._linked_master_point_indices.add(selected_master_index)
+        else:
+            self._selected_master_point_index = selected_master_index
+            self._refresh_linked_master_points()
+        self._refresh_selected_master_actor()
+        self.refresh_display_controls()
+        return True
+
+    def _refresh_linked_master_points(self) -> None:
+        point_set = self.updater.current_control_point_set()
+        if point_set is None or self._selected_master_point_index is None:
+            self._linked_master_point_indices.clear()
+            return
+        selected_point = point_set.master_point_by_index(self._selected_master_point_index)
+        if selected_point is None:
+            self._linked_master_point_indices.clear()
+            return
+
+        radius = max(float(point_set.link_radius), min(self.updater.spacing.xline, self.updater.spacing.inline))
+        linked_by_column: dict[tuple[int, int], tuple[float, int]] = {}
+        selected_column = (int(selected_point.xline_index), int(selected_point.inline_index))
+        selected_sample = float(selected_point.sample_index)
+        selected_xy = np.asarray(
+            [
+                float(selected_point.xline_index) * float(self.updater.spacing.xline),
+                float(selected_point.inline_index) * float(self.updater.spacing.inline),
+            ],
+            dtype=np.float64,
         )
+        for point in point_set.master_points:
+            if point.master_index is None or point.master_index == self._selected_master_point_index:
+                continue
+            point_column = (int(point.xline_index), int(point.inline_index))
+            if point_column == selected_column:
+                continue
+            point_xy = np.asarray(
+                [
+                    float(point.xline_index) * float(self.updater.spacing.xline),
+                    float(point.inline_index) * float(self.updater.spacing.inline),
+                ],
+                dtype=np.float64,
+            )
+            distance = float(np.linalg.norm(point_xy - selected_xy))
+            if distance <= radius:
+                z_distance = abs(float(point.sample_index) - selected_sample)
+                existing = linked_by_column.get(point_column)
+                if existing is None or z_distance < existing[0]:
+                    linked_by_column[point_column] = (z_distance, int(point.master_index))
+        self._linked_master_point_indices = {master_index for _, master_index in linked_by_column.values()}
+
+    def _qt_to_vtk_display(self, display_x: int, display_y: int) -> tuple[int, int]:
+        dpr = float(self.vtk_widget.devicePixelRatioF())
+        vtk_x = int(round(float(display_x) * dpr))
+        _, render_height = self.render_window.GetSize()
+        vtk_y = max(0, int(render_height) - 1 - int(round(float(display_y) * dpr)))
+        return vtk_x, vtk_y
+
+    def _refresh_selected_master_actor(self) -> None:
+        point_set = self.updater.current_control_point_set()
+        if point_set is None or self._selected_master_point_index is None:
+            if point_set is not None:
+                point_set.selected_master_actor.SetVisibility(False)
+            return
+
+        selected_indices = {self._selected_master_point_index, *self._linked_master_point_indices}
+        selected_points = [
+            point
+            for point in point_set.master_points
+            if point.master_index is not None and int(point.master_index) in selected_indices
+        ]
+        if not selected_points:
+            point_set.selected_master_actor.SetVisibility(False)
+            return
+
+        selected_polydata = vtk.vtkPolyData()
+        selected_vtk_points = vtk.vtkPoints()
+        for selected_point in selected_points:
+            selected_vtk_points.InsertNextPoint(
+                float(selected_point.xline_index) * float(self.updater.spacing.xline),
+                float(selected_point.inline_index) * float(self.updater.spacing.inline),
+                float(selected_point.sample_index) * float(self.updater.spacing.sample),
+            )
+        selected_polydata.SetPoints(selected_vtk_points)
+        point_set.selected_master_polydata = selected_polydata
+        mapper = vtk.vtkGlyph3DMapper()
+        mapper.SetInputData(selected_polydata)
+        mapper.SetSourceConnection(point_set.selected_master_sphere_source.GetOutputPort())
+        mapper.ScalingOff()
+        mapper.ScalarVisibilityOff()
+        point_set.selected_master_actor.SetMapper(mapper)
+        point_set.selected_master_actor.SetVisibility(point_set.visible)
+
+    def move_selected_master_point(self, delta_sample: float) -> None:
+        if self._selected_master_point_index is None:
+            return
+        moves = self._linked_moves_for_delta(delta_sample)
+        if not self.updater.edit_current_control_point_set_masters(moves):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Edit Failed",
+                self.updater.last_rebuild_error or "Failed to move the selected master point.",
+            )
+            return
+        self._refresh_selected_master_actor()
+        self.refresh_data_panel()
         self.refresh_display_controls()
         self.schedule_render()
 
-    def change_control_point_set(
-        self,
-        current: QtWidgets.QListWidgetItem | None,
-        previous: QtWidgets.QListWidgetItem | None,
-    ) -> None:
-        del previous
-        name = None if current is None else current.data(QtCore.Qt.ItemDataRole.UserRole)
-        self.updater.set_current_control_point_set(name, render=False)
-        self.refresh_display_controls()
-        self.schedule_render()
+    def _linked_moves_for_delta(self, delta_sample: float) -> list[MasterMove]:
+        point_set = self.updater.current_control_point_set()
+        if point_set is None or self._selected_master_point_index is None:
+            return []
+        selected_point = point_set.master_point_by_index(self._selected_master_point_index)
+        if selected_point is None:
+            return []
 
-    def toggle_control_point_set_visibility(self, item: QtWidgets.QListWidgetItem) -> None:
-        name = item.data(QtCore.Qt.ItemDataRole.UserRole)
-        self.updater.set_control_point_set_visibility(
-            str(name),
-            item.checkState() == QtCore.Qt.CheckState.Checked,
-            render=False,
+        min_spacing = min(self.updater.spacing.xline, self.updater.spacing.inline)
+        radius = max(float(point_set.link_radius), min_spacing)
+        selected_xy = np.asarray(
+            [
+                float(selected_point.xline_index) * float(self.updater.spacing.xline),
+                float(selected_point.inline_index) * float(self.updater.spacing.inline),
+            ],
+            dtype=np.float64,
         )
-        self.refresh_display_controls()
+
+        moves = [MasterMove(master_index=int(self._selected_master_point_index), delta_sample=float(delta_sample))]
+        for linked_index in sorted(self._linked_master_point_indices):
+            linked_point = point_set.master_point_by_index(linked_index)
+            if linked_point is None:
+                continue
+            linked_xy = np.asarray(
+                [
+                    float(linked_point.xline_index) * float(self.updater.spacing.xline),
+                    float(linked_point.inline_index) * float(self.updater.spacing.inline),
+                ],
+                dtype=np.float64,
+            )
+            distance = float(np.linalg.norm(linked_xy - selected_xy))
+            weight = max(0.0, 1.0 - distance / radius)
+            if weight <= 1e-6:
+                continue
+            moves.append(MasterMove(master_index=int(linked_index), delta_sample=float(delta_sample) * weight))
+        return moves
+
+    def open_load_seismic_dialog(self, target_category: str = "seismic") -> None:
+        dialog = LoadSeismicDialog(self, target_category=target_category)
+        if dialog.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return
+        values = dialog.values()
+        if values is None:
+            return
+        self.load_segy_volume(values)
+
+    def load_segy_volume(self, values: dict[str, object]) -> None:
+        segy_path = Path(str(values["path"])).expanduser().resolve()
+        if not segy_path.exists():
+            QtWidgets.QMessageBox.information(self, "Missing File", f"SEG-Y file not found:\n{segy_path}")
+            return
+
+        geometry = load_segy_geometry(
+            segy_path,
+            inline_field=int(values["inline_field"]),
+            xline_field=int(values["xline_field"]),
+        )
+        volume_data = read_segy_volume(
+            segy_path=segy_path,
+            geometry=geometry,
+            interval_inline=int(values["interval_inline"]),
+            interval_xline=int(values["interval_xline"]),
+            interval_sample=int(values["interval_sample"]),
+            inline_field=int(values["inline_field"]),
+            xline_field=int(values["xline_field"]),
+            name=str(values["name"]),
+        )
+        category = str(values["target_category"])
+        volume_data = volume_data.with_data(
+            volume_data.data,
+            metadata={
+                **volume_data.metadata,
+                "panel_category": category,
+            },
+        )
+
+        self.updater.spacing = RenderSpacing(
+            xline=float(values["step_xline"]),
+            inline=float(values["step_inline"]),
+            sample=float(values["step_sample"]),
+        )
+        self.updater.segy_path = segy_path
+        name = self.updater.add_attribute_volume(
+            volume_data,
+            name=str(values["name"]),
+            opacity=self.updater.opacity,
+            select=True,
+        )
+        self.image = self.updater.image
+        self._selected_data_item = (category, name)
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        self.updater.set_index("xline", len(self.updater.xlines) // 2, render=False)
+        self.updater.set_index("inline", len(self.updater.inlines) // 2, render=False)
+        self.updater.set_index("sample", len(self.updater.samples) // 2, render=False)
+        self.refresh_axis_controls()
+        configure_default_camera(self.renderer, self.updater.image)
+        self.refresh_info()
+        self.refresh_data_panel()
+        self.schedule_render()
+
+    @staticmethod
+    def _volume_payload(volume_data: VolumeData, opacity: float | None = None) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "name": volume_data.name,
+            "data": np.asarray(volume_data.data, dtype=np.float32),
+            "xlines": np.asarray(volume_data.xlines),
+            "inlines": np.asarray(volume_data.inlines),
+            "samples": np.asarray(volume_data.samples),
+            "metadata_json": json.dumps(volume_data.metadata),
+        }
+        if opacity is not None:
+            payload["opacity"] = np.array([float(opacity)], dtype=np.float32)
+        return payload
+
+    @staticmethod
+    def _volume_from_payload(payload: dict[str, object]) -> tuple[VolumeData, float | None]:
+        metadata_text = str(SegyViewerWindow._payload_scalar(payload.get("metadata_json", "{}")))
+        volume = VolumeData(
+            data=np.asarray(payload["data"], dtype=np.float32),
+            xlines=np.asarray(payload["xlines"]),
+            inlines=np.asarray(payload["inlines"]),
+            samples=np.asarray(payload["samples"]),
+            name=str(SegyViewerWindow._payload_scalar(payload["name"])),
+            metadata=json.loads(metadata_text),
+        )
+        opacity = None
+        if "opacity" in payload:
+            opacity_values = np.asarray(payload["opacity"]).ravel()
+            if opacity_values.size:
+                opacity = float(opacity_values[0])
+        return volume, opacity
+
+    @staticmethod
+    def _load_npz_payload(path: str) -> dict[str, object]:
+        with np.load(path, allow_pickle=False) as archive:
+            return {key: archive[key] for key in archive.files}
+
+    @staticmethod
+    def _payload_scalar(value: object) -> object:
+        if isinstance(value, np.ndarray) and value.shape == ():
+            return value.item()
+        return value
+
+    def _ensure_attribute_from_volume(self, volume_data: VolumeData, opacity: float | None = None) -> str:
+        if volume_data.name in self.updater.attributes:
+            return volume_data.name
+        return self.updater.add_attribute_volume(volume_data, name=volume_data.name, opacity=opacity, select=False)
+
+    def _default_output_dir(self, category: str) -> Path:
+        path = DERIVED_DATA_DIR / category
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def load_data_for_category(self, category: str) -> None:
+        if category == "seismic":
+            self.open_load_seismic_dialog(target_category=category)
+            return
+
+        if category == "attribute":
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Load Attribute",
+                str(self._default_output_dir(category)),
+                "Wesi3D Volume (*.npz)",
+            )
+            if not path:
+                return
+            payload = self._load_npz_payload(path)
+            volume, opacity = self._volume_from_payload(payload)
+            volume = volume.with_data(
+                volume.data,
+                metadata={**volume.metadata, "panel_category": "attribute"},
+            )
+            name = self.updater.add_attribute_volume(volume, name=volume.name, opacity=opacity, select=True)
+            self.image = self.updater.image
+            self._selected_data_item = ("attribute", name)
+            self.refresh_axis_controls()
+            self.refresh_scene_guides()
+            configure_default_camera(self.renderer, self.updater.image)
+            self.refresh_data_panel()
+            self.schedule_render()
+            return
+
+        if category == "horizon":
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Load Horizon",
+                str(self._default_output_dir(category)),
+                "Wesi3D Horizon (*.npz)",
+            )
+            if not path:
+                return
+            payload = self._load_npz_payload(path)
+            source_volume, source_opacity = self._volume_from_payload(
+                {
+                    "name": self._payload_scalar(payload["source_volume_name"]),
+                    "data": payload["source_volume_data"],
+                    "xlines": payload["source_volume_xlines"],
+                    "inlines": payload["source_volume_inlines"],
+                    "samples": payload["source_volume_samples"],
+                    "metadata_json": self._payload_scalar(payload["source_volume_metadata_json"]),
+                    "opacity": payload["source_volume_opacity"],
+                }
+            )
+            source_attribute_name = self._ensure_attribute_from_volume(source_volume, opacity=source_opacity)
+            name = self.updater.add_horizon(
+                str(self._payload_scalar(payload["name"])),
+                component_mask=np.asarray(payload["component_mask"], dtype=bool),
+                source_attribute_name=source_attribute_name,
+                component_index=int(np.asarray(payload["component_index"]).ravel()[0]),
+                voxel_count=int(np.asarray(payload["voxel_count"]).ravel()[0]),
+                opacity=float(np.asarray(payload["opacity"]).ravel()[0]),
+                visible=True,
+                select=True,
+            )
+            if bool(int(np.asarray(payload.get("has_control_points", np.array([0], dtype=np.uint8))).ravel()[0])):
+                points = [
+                    ControlPoint(**item)
+                    for item in json.loads(str(self._payload_scalar(payload["control_points_json"])))
+                ]
+                self.updater.set_control_points_for_horizon(
+                    name,
+                    points=points,
+                    source_attribute_name=source_attribute_name,
+                    source_horizon_name=str(self._payload_scalar(payload.get("control_point_source_horizon_name", np.array(name)))),
+                    original_horizon_mask=np.asarray(
+                        payload.get("control_point_original_horizon_mask", payload["component_mask"]),
+                        dtype=bool,
+                    ),
+                    display_scale=float(np.asarray(payload.get("control_point_display_scale", np.array([1.0], dtype=np.float32))).ravel()[0]),
+                    link_radius=float(np.asarray(payload.get("control_point_link_radius", np.array([8.0 * min(self.updater.spacing.xline, self.updater.spacing.inline)], dtype=np.float32))).ravel()[0]),
+                    visible=bool(int(np.asarray(payload.get("control_point_visible", np.array([1], dtype=np.uint8))).ravel()[0])),
+                )
+            self.refresh_data_panel()
+            self.activate_data_item("horizon", name)
+            return
+
+        QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据加载尚未实现。")
+
+    def store_data_item(self, category: str, name: str) -> None:
+        if category == "seismic":
+            attribute = self.updater.attributes[name]
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Store Seismic Data",
+                str(self._default_output_dir(category) / f"{attribute.name}.npz"),
+                "Wesi3D Volume (*.npz)",
+            )
+            if path:
+                np.savez_compressed(path, **self._volume_payload(attribute.volume_data, attribute.opacity))
+            return
+
+        if category == "attribute":
+            attribute = self.updater.attributes[name]
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Store Attribute",
+                str(self._default_output_dir(category) / f"{attribute.name}.npz"),
+                "Wesi3D Volume (*.npz)",
+            )
+            if path:
+                np.savez_compressed(path, **self._volume_payload(attribute.volume_data, attribute.opacity))
+            return
+
+        if category == "horizon":
+            horizon = self.updater.horizons[name]
+            source_attribute = self.updater.attributes[horizon.source_attribute_name]
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Store Horizon",
+                str(self._default_output_dir(category) / f"{name}.npz"),
+                "Wesi3D Horizon (*.npz)",
+            )
+            if path:
+                point_set = horizon.control_point_set
+                payload = {
+                    "name": np.array(name),
+                    "component_mask": np.asarray(horizon.component_mask, dtype=np.uint8),
+                    "component_index": np.array([horizon.component_index], dtype=np.int32),
+                    "voxel_count": np.array([horizon.voxel_count], dtype=np.int64),
+                    "opacity": np.array([horizon.opacity], dtype=np.float32),
+                    "source_attribute_name": np.array(horizon.source_attribute_name),
+                    "source_volume_name": np.array(source_attribute.volume_data.name),
+                    "source_volume_data": np.asarray(source_attribute.volume_data.data, dtype=np.float32),
+                    "source_volume_xlines": np.asarray(source_attribute.volume_data.xlines),
+                    "source_volume_inlines": np.asarray(source_attribute.volume_data.inlines),
+                    "source_volume_samples": np.asarray(source_attribute.volume_data.samples),
+                    "source_volume_metadata_json": np.array(json.dumps(source_attribute.volume_data.metadata)),
+                    "source_volume_opacity": np.array([source_attribute.opacity], dtype=np.float32),
+                    "has_control_points": np.array([0 if point_set is None else 1], dtype=np.uint8),
+                }
+                if point_set is not None:
+                    payload.update(
+                        {
+                            "control_points_json": np.array(json.dumps([vars(point) for point in point_set.points])),
+                            "control_point_display_scale": np.array([point_set.display_scale], dtype=np.float32),
+                            "control_point_link_radius": np.array([point_set.link_radius], dtype=np.float32),
+                            "control_point_visible": np.array([1 if point_set.visible else 0], dtype=np.uint8),
+                            "control_point_source_horizon_name": np.array(point_set.source_horizon_name),
+                            "control_point_original_horizon_mask": np.asarray(
+                                point_set.original_horizon_mask,
+                                dtype=np.uint8,
+                            ),
+                        }
+                    )
+                np.savez_compressed(path, **payload)
+            return
+
+        QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据存储尚未实现。")
+
+    def unload_data_item(self, category: str, name: str) -> None:
+        removed = False
+        if category in {"seismic", "attribute"}:
+            removed = self.updater.remove_attribute(name)
+            self.image = self.updater.image
+        elif category == "horizon":
+            removed = self.updater.remove_horizon(name)
+        else:
+            QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据卸载尚未实现。")
+            return
+
+        if not removed:
+            QtWidgets.QMessageBox.information(self, "Unload Failed", "当前数据无法卸载。")
+            return
+
+        current_attribute = self.updater.current_attribute()
+        fallback_category = str(
+            current_attribute.volume_data.metadata.get(
+                "panel_category",
+                "seismic" if self.updater.current_attribute_name == "seismic" else "attribute",
+            )
+        )
+        self._selected_data_item = (fallback_category, self.updater.current_attribute_name)
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        self.refresh_info()
+        self.refresh_data_panel()
         self.schedule_render()
 
     def change_control_point_size(self, value: int) -> None:
         self.updater.set_control_point_display_scale(value / 100.0, render=False)
+        self.schedule_render()
+
+    def change_control_point_link_radius(self, value: int) -> None:
+        radius = float(value) * min(self.updater.spacing.xline, self.updater.spacing.inline)
+        self.updater.set_control_point_link_radius(radius, render=False)
+        self._refresh_linked_master_points()
+        self._refresh_selected_master_actor()
+        self.refresh_display_controls()
         self.schedule_render()
 
     def apply_attribute_display(self) -> None:
@@ -1576,6 +2708,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.schedule_render()
 
     def open_extract_range_dialog(self) -> None:
+        if not self.updater.has_attribute_data():
+            return
         min_value, max_value = self.updater.current_scalar_range()
         dialog = ExtractRangeDialog(min_value, max_value, self)
         if dialog.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
@@ -1585,14 +2719,18 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             return
         min_value, max_value = values
         new_name = self.updater.extract_range_attribute(min_value, max_value)
-        self.refresh_attributes()
-        items = self.attributes_list.findItems(new_name, QtCore.Qt.MatchFlag.MatchExactly)
-        if items:
-            self.attributes_list.setCurrentItem(items[0])
-        self.refresh_display_controls()
+        self.updater.set_attribute(new_name, render=False)
+        self._selected_data_item = ("attribute", new_name)
+        self.image = self.updater.image
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        self.refresh_info()
+        self.refresh_data_panel()
         self.schedule_render()
 
     def open_extract_horizon_dialog(self) -> None:
+        if not self.updater.has_attribute_data():
+            return
         dialog = ExtractHorizonDialog(1, self)
         if dialog.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
             return
@@ -1607,11 +2745,9 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                 "No envelope components met the minimum voxel threshold.",
             )
             return
-        self.refresh_horizons()
-        items = self.horizons_list.findItems(new_names[0], QtCore.Qt.MatchFlag.MatchExactly)
-        if items:
-            self.horizons_list.setCurrentItem(items[0])
-        self.refresh_display_controls()
+        self.updater.set_current_horizon(new_names[0], render=False)
+        self._selected_data_item = ("horizon", new_names[0])
+        self.refresh_data_panel()
         self.schedule_render()
 
     def open_extract_control_points_dialog(self) -> None:
@@ -1636,12 +2772,12 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                 "No control points were generated for the current horizon.",
             )
             return
-        self.refresh_control_points()
-        for row in range(self.control_points_list.count()):
-            item = self.control_points_list.item(row)
-            if item.data(QtCore.Qt.ItemDataRole.UserRole) == new_name:
-                self.control_points_list.setCurrentItem(item)
-                break
+        self.updater.set_current_horizon(new_name, render=False)
+        self._selected_data_item = ("horizon", new_name)
+        self._selected_master_point_index = None
+        self._linked_master_point_indices.clear()
+        self._refresh_selected_master_actor()
+        self.refresh_data_panel()
         self.refresh_display_controls()
         self.schedule_render()
 
@@ -1664,15 +2800,17 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         if values is None:
             return
         master_index, delta_sample = values
-        if not self.updater.edit_current_control_point_set_master(master_index, delta_sample):
+        self._selected_master_point_index = master_index
+        self._refresh_linked_master_points()
+        if not self.updater.edit_current_control_point_set_masters(self._linked_moves_for_delta(delta_sample)):
             QtWidgets.QMessageBox.information(
                 self,
                 "Edit Failed",
-                "Failed to update the selected master point.",
+                self.updater.last_rebuild_error or "Failed to update the selected master point.",
             )
             return
-        self.refresh_control_points()
-        self.refresh_display_controls()
+        self._refresh_selected_master_actor()
+        self.refresh_data_panel()
         self.schedule_render()
 
     def rebuild_horizon_from_control_points(self) -> None:
@@ -1681,13 +2819,13 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Rebuild Failed",
-                "Failed to rebuild a horizon from the current control point set.",
+                self.updater.last_rebuild_error
+                or "Failed to rebuild a horizon from the current control point set.",
             )
             return
-        self.refresh_horizons()
-        items = self.horizons_list.findItems(new_name, QtCore.Qt.MatchFlag.MatchExactly)
-        if items:
-            self.horizons_list.setCurrentItem(items[0])
+        self.updater.set_current_horizon(new_name, render=False)
+        self._selected_data_item = ("horizon", new_name)
+        self.refresh_data_panel()
         self.schedule_render()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
@@ -1696,8 +2834,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
 
 
 def launch_vtk_viewer(
-    segy_path: Path,
-    initial_attribute: AttributeVolume,
+    segy_path: Path | None,
+    initial_attribute: AttributeVolume | None,
     spacing: RenderSpacing,
     clip_percentile: float,
     opacity_scale: float,
@@ -1712,11 +2850,17 @@ def launch_vtk_viewer(
     app.setQuitOnLastWindowClosed(True)
     debug_log(debug_ui, f"qt platform={app.platformName()} DISPLAY={os.environ.get('DISPLAY')}")
 
-    image = initial_attribute.image
-    xlines = initial_attribute.volume_data.xlines
-    inlines = initial_attribute.volume_data.inlines
-    samples = initial_attribute.volume_data.samples
-    lut = initial_attribute.lut
+    if initial_attribute is None:
+        image, lut = create_placeholder_image()
+        xlines = np.asarray([0.0], dtype=np.float32)
+        inlines = np.asarray([0.0], dtype=np.float32)
+        samples = np.asarray([0.0], dtype=np.float32)
+    else:
+        image = initial_attribute.image
+        xlines = initial_attribute.volume_data.xlines
+        inlines = initial_attribute.volume_data.inlines
+        samples = initial_attribute.volume_data.samples
+        lut = initial_attribute.lut
     dims = image.GetDimensions()
     xline_bundle = SliceActorBundle("xline", image, dims[0] // 2, lut, opacity_scale)
     inline_bundle = SliceActorBundle("inline", image, dims[1] // 2, lut, opacity_scale)
@@ -1749,7 +2893,7 @@ def launch_vtk_viewer(
 
     vtk_widget = QVTKRenderWindowInteractor()
     render_window = vtk_widget.GetRenderWindow()
-    render_window.SetWindowName(f"SEG-Y Slice Viewer - {segy_path.name}")
+    render_window.SetWindowName(f"SEG-Y Slice Viewer - {segy_path.name if segy_path is not None else 'Empty'}")
     render_window.AddRenderer(renderer)
 
     interactor = render_window.GetInteractor()
@@ -1771,7 +2915,8 @@ def launch_vtk_viewer(
         opacity=opacity_scale,
     )
 
-    configure_default_camera(renderer, image)
+    if initial_attribute is not None:
+        configure_default_camera(renderer, image)
     debug_log(debug_ui, f"vtk render window created: {type(render_window).__name__}")
     debug_log(debug_ui, f"control ranges: xline={len(xlines)} inline={len(inlines)} sample={len(samples)}")
 
@@ -1780,10 +2925,8 @@ def launch_vtk_viewer(
         vtk_widget=vtk_widget,
         render_window=render_window,
         renderer=renderer,
-        image=image,
-        xlines=xlines,
-        inlines=inlines,
-        samples=samples,
+        outline_actor=outline_actor,
+        axis_texts=axis_texts,
         debug_ui=debug_ui,
     )
     window.show()
@@ -1798,56 +2941,31 @@ def launch_vtk_viewer(
 
 def main() -> int:
     args = parse_args()
-    segy_path = Path(args.segy_path).expanduser().resolve()
-    if not segy_path.exists():
-        raise SystemExit(f"SEG-Y file not found: {segy_path}")
-
-    geometry = load_segy_geometry(segy_path)
-    volume_data = read_segy_volume(
-        segy_path=segy_path,
-        geometry=geometry,
-        interval_inline=args.interval_inline,
-        interval_xline=args.interval_xline,
-        interval_sample=args.interval_sample,
-    )
+    segy_path = None if args.segy_path is None else Path(args.segy_path).expanduser().resolve()
     spacing = RenderSpacing(
         xline=args.step_xline,
         inline=args.step_inline,
         sample=args.step_sample,
     )
-    initial_attribute = load_attribute_from_volume(
-        volume_data,
-        name="seismic",
-        spacing=spacing,
-        clip_percentile=args.clip_percentile,
-        opacity=args.opacity,
-    )
-    dims_text = (
-        f"xlines={len(volume_data.xlines)}, "
-        f"inlines={len(volume_data.inlines)}, "
-        f"samples={len(volume_data.samples)}"
-    )
-
-    print(f"SEG-Y: {segy_path}")
-    print(
-        "Original grid: "
-        f"inlines={len(geometry.inlines)}, "
-        f"xlines={len(geometry.xlines)}, "
-        f"samples={len(geometry.sample_axis)}"
-    )
-    print(f"Displayed grid: {dims_text}")
-    print(
-        "Intervals: "
-        f"inline={args.interval_inline}, "
-        f"xline={args.interval_xline}, "
-        f"sample={args.interval_sample}"
-    )
-    print(
-        "Steps: "
-        f"inline={args.step_inline}, "
-        f"xline={args.step_xline}, "
-        f"sample={args.step_sample}"
-    )
+    initial_attribute = None
+    if segy_path is not None:
+        if not segy_path.exists():
+            raise SystemExit(f"SEG-Y file not found: {segy_path}")
+        geometry = load_segy_geometry(segy_path)
+        volume_data = read_segy_volume(
+            segy_path=segy_path,
+            geometry=geometry,
+            interval_inline=args.interval_inline,
+            interval_xline=args.interval_xline,
+            interval_sample=args.interval_sample,
+        )
+        initial_attribute = load_attribute_from_volume(
+            volume_data.with_data(volume_data.data, metadata={**volume_data.metadata, "panel_category": "seismic"}),
+            name="seismic",
+            spacing=spacing,
+            clip_percentile=args.clip_percentile,
+            opacity=args.opacity,
+        )
 
     return launch_vtk_viewer(
         initial_attribute=initial_attribute,
