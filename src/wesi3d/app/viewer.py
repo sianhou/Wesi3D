@@ -94,6 +94,9 @@ class ControlPointSet:
     master_actor: vtk.vtkActor
     master_sphere_source: vtk.vtkSphereSource
     master_polydata: vtk.vtkPolyData
+    linked_master_actor: vtk.vtkActor
+    linked_master_sphere_source: vtk.vtkSphereSource
+    linked_master_polydata: vtk.vtkPolyData
     selected_master_actor: vtk.vtkActor
     selected_master_sphere_source: vtk.vtkSphereSource
     selected_master_polydata: vtk.vtkPolyData
@@ -104,6 +107,7 @@ class ControlPointSet:
     original_horizon_mask: np.ndarray
     display_scale: float = 1.0
     link_radius: float = 8.0
+    rebuild_smoothness: float = 0.55
     visible: bool = True
 
     @property
@@ -279,6 +283,7 @@ def create_horizon_surface_actor(
     scalar_values: np.ndarray,
     spacing: RenderSpacing,
     clip_percentile: float,
+    smoothing: float = 0.55,
 ) -> tuple[vtk.vtkActor, vtk.vtkPolyData, vtk.vtkPolyDataMapper, vtk.vtkLookupTable, tuple[float, float]]:
     padded = np.pad(mask.astype(np.uint8), 1, mode="constant", constant_values=0)
     padded_values = np.pad(np.asarray(scalar_values, dtype=np.float32), 1, mode="edge")
@@ -306,10 +311,11 @@ def create_horizon_surface_actor(
 
     smoother = vtk.vtkWindowedSincPolyDataFilter()
     smoother.SetInputConnection(surface.GetOutputPort())
-    smoother.SetNumberOfIterations(20)
+    smooth_factor = max(0.0, min(1.0, float(smoothing)))
+    smoother.SetNumberOfIterations(int(round(8 + smooth_factor * 36)))
     smoother.BoundarySmoothingOff()
     smoother.FeatureEdgeSmoothingOff()
-    smoother.SetPassBand(0.08)
+    smoother.SetPassBand(0.18 - smooth_factor * 0.14)
     smoother.NonManifoldSmoothingOn()
     smoother.NormalizeCoordinatesOn()
 
@@ -365,6 +371,9 @@ def create_control_point_actor(
     spacing: RenderSpacing,
     display_scale: float = 1.0,
 ) -> tuple[
+    vtk.vtkActor,
+    vtk.vtkPolyData,
+    vtk.vtkSphereSource,
     vtk.vtkActor,
     vtk.vtkPolyData,
     vtk.vtkSphereSource,
@@ -448,13 +457,23 @@ def create_control_point_actor(
         color=(1.0, 0.28, 0.18),
         opacity=0.98,
     )
+    linked_master_polydata = _make_polydata([])
+    linked_master_actor, linked_master_sphere = _make_actor(
+        linked_master_polydata,
+        radius_factor=0.508,
+        theta=22,
+        phi=22,
+        color=(0.16, 0.82, 1.0),
+        opacity=0.96,
+    )
+    linked_master_actor.SetVisibility(False)
     selected_master_polydata = _make_polydata([])
     selected_master_actor, selected_master_sphere = _make_actor(
         selected_master_polydata,
-        radius_factor=0.572,
+        radius_factor=0.66,
         theta=24,
         phi=24,
-        color=(0.22, 1.0, 0.40),
+        color=(0.20, 1.0, 0.32),
         opacity=1.0,
     )
     selected_master_actor.SetVisibility(False)
@@ -465,6 +484,9 @@ def create_control_point_actor(
         master_actor,
         master_polydata,
         master_sphere,
+        linked_master_actor,
+        linked_master_polydata,
+        linked_master_sphere,
         selected_master_actor,
         selected_master_polydata,
         selected_master_sphere,
@@ -1272,8 +1294,10 @@ class SliceUpdater:
                 point_set.actor.GetProperty().SetColor(*( (1.0, 0.86, 0.24) if is_current else (0.92, 0.68, 0.20) ))
                 point_set.master_actor.GetProperty().SetOpacity((1.0 if is_current else 0.88) if point_set.visible else 0.0)
                 point_set.master_actor.GetProperty().SetColor(*( (1.0, 0.20, 0.12) if is_current else (0.92, 0.36, 0.22) ))
+                point_set.linked_master_actor.GetProperty().SetOpacity((0.98 if is_current else 0.84) if point_set.visible else 0.0)
                 point_set.actor.SetVisibility(point_set.visible)
                 point_set.master_actor.SetVisibility(point_set.visible)
+                point_set.linked_master_actor.SetVisibility(False)
                 point_set.selected_master_actor.SetVisibility(False)
         if render:
             self.interactor.GetRenderWindow().Render()
@@ -1348,6 +1372,9 @@ class SliceUpdater:
             master_actor,
             master_polydata,
             master_sphere_source,
+            linked_master_actor,
+            linked_master_polydata,
+            linked_master_sphere_source,
             selected_master_actor,
             selected_master_polydata,
             selected_master_sphere_source,
@@ -1358,11 +1385,14 @@ class SliceUpdater:
         )
         point_set.actor.SetMapper(actor.GetMapper())
         point_set.master_actor.SetMapper(master_actor.GetMapper())
+        point_set.linked_master_actor.SetMapper(linked_master_actor.GetMapper())
         point_set.selected_master_actor.SetMapper(selected_master_actor.GetMapper())
         point_set.sphere_source = sphere_source
         point_set.polydata = polydata
         point_set.master_sphere_source = master_sphere_source
         point_set.master_polydata = master_polydata
+        point_set.linked_master_sphere_source = linked_master_sphere_source
+        point_set.linked_master_polydata = linked_master_polydata
         point_set.selected_master_sphere_source = selected_master_sphere_source
         point_set.selected_master_polydata = selected_master_polydata
         current_horizon = self.current_horizon()
@@ -1399,6 +1429,7 @@ class SliceUpdater:
                 source_attribute.volume_data.data,
                 self.spacing,
                 self.clip_percentile,
+                smoothing=point_set.rebuild_smoothness,
             )
         except ValueError as exc:
             self.last_rebuild_error = str(exc)
@@ -1448,6 +1479,7 @@ class SliceUpdater:
                 source_attribute.volume_data.data,
                 self.spacing,
                 self.clip_percentile,
+                smoothing=point_set.rebuild_smoothness,
             )
         except ValueError as exc:
             self.last_rebuild_error = str(exc)
@@ -1480,6 +1512,7 @@ class SliceUpdater:
             ),
             base_polydata=clone_polydata(polydata),
         )
+        horizon.control_point_set.rebuild_smoothness = point_set.rebuild_smoothness
         self.horizons[new_name] = horizon
         self.renderer.AddActor(actor)
         self._add_control_point_actors(horizon.control_point_set)
@@ -1547,6 +1580,9 @@ class SliceUpdater:
             master_actor,
             master_polydata,
             master_sphere_source,
+            linked_master_actor,
+            linked_master_polydata,
+            linked_master_sphere_source,
             selected_master_actor,
             selected_master_polydata,
             selected_master_sphere_source,
@@ -1563,6 +1599,9 @@ class SliceUpdater:
             master_actor=master_actor,
             master_sphere_source=master_sphere_source,
             master_polydata=master_polydata,
+            linked_master_actor=linked_master_actor,
+            linked_master_sphere_source=linked_master_sphere_source,
+            linked_master_polydata=linked_master_polydata,
             selected_master_actor=selected_master_actor,
             selected_master_sphere_source=selected_master_sphere_source,
             selected_master_polydata=selected_master_polydata,
@@ -1575,6 +1614,7 @@ class SliceUpdater:
             link_radius=float(
                 (8.0 * min(self.spacing.xline, self.spacing.inline)) if link_radius is None else link_radius
             ),
+            rebuild_smoothness=0.55,
             visible=bool(visible),
         )
 
@@ -1583,6 +1623,7 @@ class SliceUpdater:
             return
         self.renderer.AddActor(point_set.actor)
         self.renderer.AddActor(point_set.master_actor)
+        self.renderer.AddActor(point_set.linked_master_actor)
         self.renderer.AddActor(point_set.selected_master_actor)
 
     def _remove_control_point_actors(self, point_set: ControlPointSet | None) -> None:
@@ -1590,6 +1631,7 @@ class SliceUpdater:
             return
         self.renderer.RemoveActor(point_set.actor)
         self.renderer.RemoveActor(point_set.master_actor)
+        self.renderer.RemoveActor(point_set.linked_master_actor)
         self.renderer.RemoveActor(point_set.selected_master_actor)
 
     def set_control_points_for_horizon(
@@ -1605,6 +1647,7 @@ class SliceUpdater:
         visible: bool = True,
     ) -> str:
         horizon = self.horizons[horizon_name]
+        existing_smoothness = 0.55 if horizon.control_point_set is None else horizon.control_point_set.rebuild_smoothness
         self._remove_control_point_actors(horizon.control_point_set)
         horizon.control_point_set = self._build_control_point_set(
             name=f"{horizon.name}_control_points",
@@ -1617,6 +1660,7 @@ class SliceUpdater:
             link_radius=link_radius,
             visible=visible,
         )
+        horizon.control_point_set.rebuild_smoothness = existing_smoothness
         self._add_control_point_actors(horizon.control_point_set)
         self.set_current_horizon(horizon_name, render=False)
         return horizon_name
@@ -1659,6 +1703,12 @@ class SliceUpdater:
             return None
         return float(point_set.link_radius)
 
+    def current_control_point_rebuild_smoothness(self) -> float | None:
+        point_set = self.current_control_point_set()
+        if point_set is None:
+            return None
+        return float(point_set.rebuild_smoothness)
+
     def set_control_point_display_scale(self, scale: float, render: bool = True) -> None:
         point_set = self.current_control_point_set()
         if point_set is None:
@@ -1680,6 +1730,8 @@ class SliceUpdater:
         point_set.sphere_source.Update()
         point_set.master_sphere_source.SetRadius(master_radius)
         point_set.master_sphere_source.Update()
+        point_set.linked_master_sphere_source.SetRadius(master_radius * 1.15)
+        point_set.linked_master_sphere_source.Update()
         point_set.selected_master_sphere_source.SetRadius(master_radius * 1.3)
         point_set.selected_master_sphere_source.Update()
         if render:
@@ -1691,6 +1743,14 @@ class SliceUpdater:
             return
         min_spacing = min(self.spacing.xline, self.spacing.inline)
         point_set.link_radius = max(min_spacing, float(radius))
+        if render:
+            self.interactor.GetRenderWindow().Render()
+
+    def set_control_point_rebuild_smoothness(self, smoothness: float, render: bool = True) -> None:
+        point_set = self.current_control_point_set()
+        if point_set is None:
+            return
+        point_set.rebuild_smoothness = max(0.0, min(1.0, float(smoothness)))
         if render:
             self.interactor.GetRenderWindow().Render()
 
@@ -1913,6 +1973,15 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.control_point_link_radius_slider.valueChanged.connect(self.change_control_point_link_radius)
         control_point_link_row.addWidget(self.control_point_link_radius_slider, stretch=1)
         control_point_tools_layout.addLayout(control_point_link_row)
+
+        control_point_smooth_row = QtWidgets.QHBoxLayout()
+        control_point_smooth_row.setSpacing(6)
+        control_point_smooth_row.addWidget(QtWidgets.QLabel("Smooth"))
+        self.control_point_smoothness_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.control_point_smoothness_slider.setRange(0, 100)
+        self.control_point_smoothness_slider.valueChanged.connect(self.change_control_point_smoothness)
+        control_point_smooth_row.addWidget(self.control_point_smoothness_slider, stretch=1)
+        control_point_tools_layout.addLayout(control_point_smooth_row)
         panel_layout.addWidget(control_point_tools_group)
 
         panel_layout.addStretch(1)
@@ -2084,6 +2153,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.rebuild_horizon_button.setEnabled(has_control_points)
         self.control_point_size_slider.setEnabled(has_control_points)
         self.control_point_link_radius_slider.setEnabled(has_control_points)
+        self.control_point_smoothness_slider.setEnabled(has_control_points)
         has_selected_master = has_control_points and self._selected_master_point_index is not None
         self.move_master_up_button.setEnabled(has_selected_master)
         self.move_master_down_button.setEnabled(has_selected_master)
@@ -2105,6 +2175,12 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             int(round((min_spacing if link_radius is None else link_radius) / max(min_spacing, 1e-6)))
         )
         self.control_point_link_radius_slider.blockSignals(False)
+        smoothness = self.updater.current_control_point_rebuild_smoothness()
+        self.control_point_smoothness_slider.blockSignals(True)
+        self.control_point_smoothness_slider.setValue(
+            int(round((0.55 if smoothness is None else smoothness) * 100.0))
+        )
+        self.control_point_smoothness_slider.blockSignals(False)
 
         self.extract_button.setEnabled(has_attribute)
         self.extract_envelope_button.setEnabled(has_attribute)
@@ -2171,7 +2247,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         picked_actor = None
         if self._prop_picker.Pick(float(vtk_display_x), float(vtk_display_y), 0.0, self.renderer) != 0:
             picked_actor = self._prop_picker.GetActor()
-            if picked_actor not in {point_set.master_actor, point_set.selected_master_actor}:
+            if picked_actor not in {point_set.master_actor, point_set.linked_master_actor, point_set.selected_master_actor}:
                 picked_actor = None
 
         selected_master: ControlPoint | None = None
@@ -2274,27 +2350,46 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         point_set = self.updater.current_control_point_set()
         if point_set is None or self._selected_master_point_index is None:
             if point_set is not None:
+                point_set.linked_master_actor.SetVisibility(False)
                 point_set.selected_master_actor.SetVisibility(False)
             return
 
-        selected_indices = {self._selected_master_point_index, *self._linked_master_point_indices}
-        selected_points = [
+        linked_points = [
             point
             for point in point_set.master_points
-            if point.master_index is not None and int(point.master_index) in selected_indices
+            if point.master_index is not None and int(point.master_index) in self._linked_master_point_indices
         ]
-        if not selected_points:
+        selected_point = point_set.master_point_by_index(self._selected_master_point_index)
+        if selected_point is None:
+            point_set.linked_master_actor.SetVisibility(False)
             point_set.selected_master_actor.SetVisibility(False)
             return
 
+        linked_polydata = vtk.vtkPolyData()
+        linked_vtk_points = vtk.vtkPoints()
+        for linked_point in linked_points:
+            linked_vtk_points.InsertNextPoint(
+                float(linked_point.xline_index) * float(self.updater.spacing.xline),
+                float(linked_point.inline_index) * float(self.updater.spacing.inline),
+                float(linked_point.sample_index) * float(self.updater.spacing.sample),
+            )
+        linked_polydata.SetPoints(linked_vtk_points)
+        point_set.linked_master_polydata = linked_polydata
+        linked_mapper = vtk.vtkGlyph3DMapper()
+        linked_mapper.SetInputData(linked_polydata)
+        linked_mapper.SetSourceConnection(point_set.linked_master_sphere_source.GetOutputPort())
+        linked_mapper.ScalingOff()
+        linked_mapper.ScalarVisibilityOff()
+        point_set.linked_master_actor.SetMapper(linked_mapper)
+        point_set.linked_master_actor.SetVisibility(point_set.visible and len(linked_points) > 0)
+
         selected_polydata = vtk.vtkPolyData()
         selected_vtk_points = vtk.vtkPoints()
-        for selected_point in selected_points:
-            selected_vtk_points.InsertNextPoint(
-                float(selected_point.xline_index) * float(self.updater.spacing.xline),
-                float(selected_point.inline_index) * float(self.updater.spacing.inline),
-                float(selected_point.sample_index) * float(self.updater.spacing.sample),
-            )
+        selected_vtk_points.InsertNextPoint(
+            float(selected_point.xline_index) * float(self.updater.spacing.xline),
+            float(selected_point.inline_index) * float(self.updater.spacing.inline),
+            float(selected_point.sample_index) * float(self.updater.spacing.sample),
+        )
         selected_polydata.SetPoints(selected_vtk_points)
         point_set.selected_master_polydata = selected_polydata
         mapper = vtk.vtkGlyph3DMapper()
@@ -2555,6 +2650,11 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                     link_radius=float(np.asarray(payload.get("control_point_link_radius", np.array([8.0 * min(self.updater.spacing.xline, self.updater.spacing.inline)], dtype=np.float32))).ravel()[0]),
                     visible=bool(int(np.asarray(payload.get("control_point_visible", np.array([1], dtype=np.uint8))).ravel()[0])),
                 )
+                loaded_point_set = self.updater.horizons[name].control_point_set
+                if loaded_point_set is not None:
+                    loaded_point_set.rebuild_smoothness = float(
+                        np.asarray(payload.get("control_point_rebuild_smoothness", np.array([0.55], dtype=np.float32))).ravel()[0]
+                    )
             self.refresh_data_panel()
             self.activate_data_item("horizon", name)
             return
@@ -2619,6 +2719,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                             "control_points_json": np.array(json.dumps([vars(point) for point in point_set.points])),
                             "control_point_display_scale": np.array([point_set.display_scale], dtype=np.float32),
                             "control_point_link_radius": np.array([point_set.link_radius], dtype=np.float32),
+                            "control_point_rebuild_smoothness": np.array([point_set.rebuild_smoothness], dtype=np.float32),
                             "control_point_visible": np.array([1 if point_set.visible else 0], dtype=np.uint8),
                             "control_point_source_horizon_name": np.array(point_set.source_horizon_name),
                             "control_point_original_horizon_mask": np.asarray(
@@ -2670,6 +2771,16 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.updater.set_control_point_link_radius(radius, render=False)
         self._refresh_linked_master_points()
         self._refresh_selected_master_actor()
+        self.refresh_display_controls()
+        self.schedule_render()
+
+    def change_control_point_smoothness(self, value: int) -> None:
+        self.updater.set_control_point_rebuild_smoothness(value / 100.0, render=False)
+        point_set = self.updater.current_control_point_set()
+        current_horizon = self.updater.current_horizon()
+        if point_set is not None and current_horizon is not None:
+            self.updater._apply_control_point_deformation_to_horizon(current_horizon.name, point_set)
+        self.refresh_data_panel()
         self.refresh_display_controls()
         self.schedule_render()
 
