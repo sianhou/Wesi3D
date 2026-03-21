@@ -31,6 +31,7 @@ class ControlPoint:
     sample: float
     value: float
     kind: str
+    base_sample_index: int | None = None
     master_index: int | None = None
     dz: float = 0.0
 
@@ -68,27 +69,39 @@ def boundary_mask(mask: np.ndarray) -> np.ndarray:
 
 
 def _build_point(
-    volume_data: VolumeData,
+    xlines: np.ndarray,
+    inlines: np.ndarray,
+    samples: np.ndarray,
     xline_index: int,
     inline_index: int,
     sample_index: int,
     kind: str,
+    value_volume_data: VolumeData | None = None,
 ) -> ControlPoint:
+    point_value = (
+        0.0
+        if value_volume_data is None
+        else float(value_volume_data.data[xline_index, inline_index, sample_index])
+    )
     return ControlPoint(
         xline_index=int(xline_index),
         inline_index=int(inline_index),
         sample_index=int(sample_index),
-        xline=float(volume_data.xlines[xline_index]),
-        inline=float(volume_data.inlines[inline_index]),
-        sample=float(volume_data.samples[sample_index]),
-        value=float(volume_data.data[xline_index, inline_index, sample_index]),
+        base_sample_index=int(sample_index),
+        xline=float(xlines[xline_index]),
+        inline=float(inlines[inline_index]),
+        sample=float(samples[sample_index]),
+        value=point_value,
         kind=kind,
     )
 
 
 def extract_control_points(
-    volume_data: VolumeData,
+    xlines: np.ndarray,
+    inlines: np.ndarray,
+    samples: np.ndarray,
     component_mask: np.ndarray,
+    value_volume_data: VolumeData | None = None,
     *,
     surface_xline_interval: int = 8,
     surface_inline_interval: int = 8,
@@ -114,11 +127,14 @@ def extract_control_points(
             continue
         points.append(
             _build_point(
-                volume_data,
+                xlines,
+                inlines,
+                samples,
                 int(xline_index),
                 int(inline_index),
                 int(sample_index),
                 "surface",
+                value_volume_data=value_volume_data,
             )
         )
 
@@ -131,11 +147,14 @@ def extract_control_points(
             continue
         points.append(
             _build_point(
-                volume_data,
+                xlines,
+                inlines,
+                samples,
                 int(xline_index),
                 int(inline_index),
                 int(sample_index),
                 "interior",
+                value_volume_data=value_volume_data,
             )
         )
 
@@ -188,19 +207,22 @@ def apply_master_point_z_move(
     points: list[ControlPoint],
     selected_master_index: int,
     delta_sample: float,
-    volume_data: VolumeData,
+    sample_axis: np.ndarray,
+    value_volume_data: VolumeData | None = None,
 ) -> list[ControlPoint]:
     return apply_master_point_z_moves(
         points,
         [MasterMove(master_index=int(selected_master_index), delta_sample=float(delta_sample))],
-        volume_data,
+        sample_axis,
+        value_volume_data=value_volume_data,
     )
 
 
 def apply_master_point_z_moves(
     points: list[ControlPoint],
     moves: list[MasterMove],
-    volume_data: VolumeData,
+    sample_axis: np.ndarray,
+    value_volume_data: VolumeData | None = None,
 ) -> list[ControlPoint]:
     if not points:
         return []
@@ -228,21 +250,29 @@ def apply_master_point_z_moves(
 
     new_points: list[ControlPoint] = []
     min_sample = 0
-    max_sample = len(volume_data.samples) - 1
+    samples = np.asarray(sample_axis)
+    max_sample = len(samples) - 1
     for point in points:
         dz = _point_delta_from_master_moves(point, move_map, column_surface_points)
-        new_sample_index = int(np.clip(round(point.sample_index + dz), min_sample, max_sample))
+        base_sample_index = int(point.sample_index if point.base_sample_index is None else point.base_sample_index)
+        total_dz = float(point.dz + dz)
+        new_sample_index = int(np.clip(round(base_sample_index + total_dz), min_sample, max_sample))
         new_point = ControlPoint(
             xline_index=int(point.xline_index),
             inline_index=int(point.inline_index),
             sample_index=new_sample_index,
+            base_sample_index=base_sample_index,
             xline=float(point.xline),
             inline=float(point.inline),
-            sample=float(volume_data.samples[new_sample_index]),
-            value=float(volume_data.data[point.xline_index, point.inline_index, new_sample_index]),
+            sample=float(samples[new_sample_index]),
+            value=(
+                float(point.value)
+                if value_volume_data is None
+                else float(value_volume_data.data[point.xline_index, point.inline_index, new_sample_index])
+            ),
             kind=point.kind,
             master_index=point.master_index,
-            dz=float(point.dz + dz),
+            dz=total_dz,
         )
         new_points.append(new_point)
     return new_points
@@ -255,6 +285,8 @@ def _point_delta_from_master_moves(
 ) -> float:
     if point.master_index is not None and int(point.master_index) in move_map:
         return float(move_map[int(point.master_index)])
+    if point.kind == "surface" and point.master_index is not None:
+        return 0.0
 
     column_key = (int(point.xline_index), int(point.inline_index))
     column_points = column_surface_points.get(column_key, [])
