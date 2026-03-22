@@ -297,7 +297,7 @@ def _point_delta_from_master_moves(
     ]
     if not moved_column_points:
         return 0.0
-    if len(moved_column_points) == 1 or len(column_points) <= 1:
+    if len(column_points) <= 1:
         moved_point = moved_column_points[0]
         return float(move_map[int(moved_point.master_index)])
 
@@ -371,6 +371,7 @@ def rebuild_mask_from_master_points(
         return mask
 
     column_mask = np.asarray(reference_mask, dtype=bool).any(axis=2)
+    column_mask = _expand_column_mask(column_mask)
     if not np.any(column_mask):
         return mask
 
@@ -395,8 +396,10 @@ def rebuild_mask_from_master_points(
 
     max_sample = shape[2] - 1
     for index, (xi, yi) in enumerate(target_columns):
-        z0 = int(np.clip(round(lower_surface[index]), 0, max_sample))
-        z1 = int(np.clip(round(upper_surface[index]), 0, max_sample))
+        # Treat any voxel touched by the interpolated horizon as inside the mask,
+        # rather than requiring the voxel center to fall inside.
+        z0 = int(np.clip(np.floor(lower_surface[index]), 0, max_sample))
+        z1 = int(np.clip(np.ceil(upper_surface[index]), 0, max_sample))
         if z0 > z1:
             z0, z1 = z1, z0
         mask[int(xi), int(yi), z0 : z1 + 1] = True
@@ -408,6 +411,19 @@ def rebuild_mask_from_master_points(
         zi = int(np.clip(sample_index, 0, max_sample))
         mask[int(xi), int(yi), zi] = True
     return mask
+
+
+def _expand_column_mask(column_mask: np.ndarray) -> np.ndarray:
+    expanded = np.asarray(column_mask, dtype=bool).copy()
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        shifted = np.zeros_like(expanded, dtype=bool)
+        src_x = slice(max(0, -dx), expanded.shape[0] - max(0, dx))
+        src_y = slice(max(0, -dy), expanded.shape[1] - max(0, dy))
+        dst_x = slice(max(0, dx), expanded.shape[0] - max(0, -dx))
+        dst_y = slice(max(0, dy), expanded.shape[1] - max(0, -dy))
+        shifted[dst_x, dst_y] = expanded[src_x, src_y]
+        expanded |= shifted
+    return expanded
 
 
 def _interpolate_column_surface(

@@ -220,3 +220,133 @@ def extract_envelope_volumes(
             )
         )
     return output_volumes
+
+
+def interpolate_control_point_values_to_volume(
+    template_volume: VolumeData,
+    points: list[object],
+    *,
+    apply_mask: bool = False,
+    mask: np.ndarray | None = None,
+    radius: float = 0.0,
+    power: float = 2.0,
+    k_neighbors: int = 16,
+    chunk_size: int = 32768,
+    name: str | None = None,
+) -> VolumeData:
+    if not points:
+        raise ValueError("No control points are available for interpolation.")
+
+    control_coords: list[tuple[float, float, float]] = []
+    control_values: list[float] = []
+    for point in points:
+        value = float(getattr(point, "value", 0.0))
+        if not np.isfinite(value):
+            continue
+        control_coords.append(
+            (
+                float(getattr(point, "xline_index")),
+                float(getattr(point, "inline_index")),
+                float(getattr(point, "sample_index")),
+            )
+        )
+        control_values.append(value)
+
+    if not control_coords:
+        raise ValueError("No valid control-point values are available for interpolation.")
+
+    source_coords = np.asarray(control_coords, dtype=np.float32)
+    source_values = np.asarray(control_values, dtype=np.float32)
+    radius = max(0.0, float(radius))
+    radius2 = radius * radius
+    power = max(1e-6, float(power))
+    k_neighbors = max(1, min(int(k_neighbors), len(source_values)))
+    working_mask = np.ones(template_volume.shape, dtype=bool)
+    if apply_mask:
+        if mask is None:
+            raise ValueError("Mask interpolation is enabled, but the horizon mask is missing.")
+        working_mask = np.asarray(mask, dtype=bool)
+        if working_mask.shape != template_volume.shape:
+            raise ValueError("The horizon mask shape does not match the selected attribute grid.")
+
+    target_indices = np.argwhere(working_mask)
+    output = np.zeros(template_volume.shape, dtype=np.float32)
+    if len(target_indices) == 0:
+        output_name = f"{template_volume.name}_interpolated" if name is None else name
+        return template_volume.with_data(
+            output,
+            name=output_name,
+            metadata={
+                **template_volume.metadata,
+                "operation": "interpolate_control_points",
+                "apply_mask": bool(apply_mask),
+                "source_control_points": int(len(source_values)),
+            },
+        )
+
+    for start in range(0, len(target_indices), max(1, int(chunk_size))):
+        batch = np.asarray(target_indices[start : start + max(1, int(chunk_size))], dtype=np.float32)
+        diff = batch[:, None, :] - source_coords[None, :, :]
+        dist2 = np.sum(diff * diff, axis=2)
+
+        if k_neighbors < source_coords.shape[0]:
+            nearest = np.argpartition(dist2, kth=k_neighbors - 1, axis=1)[:, :k_neighbors]
+            nearest_dist2 = np.take_along_axis(dist2, nearest, axis=1)
+            nearest_values = source_values[nearest]
+        else:
+            nearest_dist2 = dist2
+            nearest_values = np.broadcast_to(source_values[None, :], dist2.shape)
+
+        batch_values = np.empty(len(batch), dtype=np.float32)
+        zero_mask = nearest_dist2 <= 1e-12
+        exact_rows = np.any(zero_mask, axis=1)
+        if np.any(exact_rows):
+            row_indices = np.nonzero(exact_rows)[0]
+            zero_cols = np.argmax(zero_mask[exact_rows], axis=1)
+            batch_values[row_indices] = nearest_values[exact_rows, zero_cols]
+
+        smooth_rows = ~exact_rows
+        if np.any(smooth_rows):
+            smooth_dist2 = nearest_dist2[smooth_rows]
+            smooth_values = nearest_values[smooth_rows]
+            if radius > 0.0:
+                # Use radius as a soft decay scale instead of a hard cutoff.
+                # This avoids abrupt boundary artifacts when a voxel falls just
+                # outside the radius and would otherwise collapse to nearest-point fallback.
+                idw_weights = 1.0 / np.power(np.maximum(smooth_dist2, 1e-12), power * 0.5)
+                radial_weights = np.exp(-smooth_dist2 / max(radius2, 1e-12))
+                weights = idw_weights * radial_weights
+                weight_sums = np.sum(weights, axis=1)
+                valid_rows = weight_sums > 1e-12
+                if np.any(valid_rows):
+                    weighted_values = np.sum(weights[valid_rows] * smooth_values[valid_rows], axis=1) / weight_sums[valid_rows]
+                    smooth_indices = np.nonzero(smooth_rows)[0][valid_rows]
+                    batch_values[smooth_indices] = weighted_values.astype(np.float32)
+                if np.any(~valid_rows):
+                    fallback_dist2 = smooth_dist2[~valid_rows]
+                    fallback_values = smooth_values[~valid_rows]
+                    nearest_idx = np.argmin(fallback_dist2, axis=1)
+                    smooth_indices = np.nonzero(smooth_rows)[0][~valid_rows]
+                    batch_values[smooth_indices] = fallback_values[np.arange(len(nearest_idx)), nearest_idx].astype(np.float32)
+            else:
+                weights = 1.0 / np.power(np.maximum(smooth_dist2, 1e-12), power * 0.5)
+                weighted_values = np.sum(weights * smooth_values, axis=1) / np.sum(weights, axis=1)
+                batch_values[smooth_rows] = weighted_values.astype(np.float32)
+
+        batch_index = target_indices[start : start + max(1, int(chunk_size))]
+        output[batch_index[:, 0], batch_index[:, 1], batch_index[:, 2]] = batch_values
+
+    output_name = f"{template_volume.name}_interpolated" if name is None else name
+    return template_volume.with_data(
+        output,
+        name=output_name,
+        metadata={
+            **template_volume.metadata,
+            "operation": "interpolate_control_points",
+            "apply_mask": bool(apply_mask),
+            "source_control_points": int(len(source_values)),
+            "radius": float(radius),
+            "power": float(power),
+            "k_neighbors": int(k_neighbors),
+        },
+    )

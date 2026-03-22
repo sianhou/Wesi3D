@@ -62,9 +62,14 @@ from ..processing.control_points import (
     apply_master_point_z_moves,
     extract_control_points,
     master_control_points,
+    rebuild_mask_from_master_points,
 )
 from ..utils.constants import INLINE_FIELD, XLINE_FIELD
-from ..processing.volume_processing import extract_connected_components, extract_range_volume
+from ..processing.volume_processing import (
+    extract_connected_components,
+    extract_range_volume,
+    interpolate_control_point_values_to_volume,
+)
 from ..utils.constants import APP_NAME
 from ..utils.formatting import format_value
 
@@ -116,6 +121,8 @@ class ControlPointSet:
     use_attribute_colormap: bool
     source_horizon_name: str
     original_horizon_mask: np.ndarray
+    value_colormap_name: str = DEFAULT_COLORMAP_NAME
+    value_color_range: tuple[float, float] | None = None
     display_scale: float = 1.0
     link_radius: float = 8.0
     rebuild_smoothness: float = 0.55
@@ -703,6 +710,66 @@ def polydata_from_payload(
     return polydata
 
 
+def polydata_to_mask(
+    polydata: vtk.vtkPolyData,
+    shape: tuple[int, int, int],
+    spacing: RenderSpacing,
+    *,
+    dilate_steps: int = 1,
+) -> np.ndarray:
+    if polydata.GetNumberOfPoints() == 0 or polydata.GetNumberOfPolys() == 0:
+        return np.zeros(shape, dtype=bool)
+
+    image = vtk.vtkImageData()
+    image.SetDimensions(*shape)
+    image.SetSpacing(float(spacing.xline), float(spacing.inline), float(spacing.sample))
+    image.SetOrigin(0.0, 0.0, 0.0)
+    image.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
+    image.GetPointData().GetScalars().Fill(1)
+
+    stencil = vtk.vtkPolyDataToImageStencil()
+    stencil.SetInputData(polydata)
+    stencil.SetOutputOrigin(image.GetOrigin())
+    stencil.SetOutputSpacing(image.GetSpacing())
+    stencil.SetOutputWholeExtent(image.GetExtent())
+    stencil.Update()
+
+    image_stencil = vtk.vtkImageStencil()
+    image_stencil.SetInputData(image)
+    image_stencil.SetStencilConnection(stencil.GetOutputPort())
+    image_stencil.ReverseStencilOff()
+    image_stencil.SetBackgroundValue(0)
+    image_stencil.Update()
+
+    mask = np.asarray(
+        numpy_support.vtk_to_numpy(image_stencil.GetOutput().GetPointData().GetScalars()),
+        dtype=np.uint8,
+    ).reshape(shape, order="F") > 0
+
+    expanded = np.asarray(mask, dtype=bool)
+    for _ in range(max(0, int(dilate_steps))):
+        grown = expanded.copy()
+        for dx, dy, dz in (
+            (-1, 0, 0),
+            (1, 0, 0),
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+        ):
+            shifted = np.zeros_like(expanded, dtype=bool)
+            src_x = slice(max(0, -dx), expanded.shape[0] - max(0, dx))
+            src_y = slice(max(0, -dy), expanded.shape[1] - max(0, dy))
+            src_z = slice(max(0, -dz), expanded.shape[2] - max(0, dz))
+            dst_x = slice(max(0, dx), expanded.shape[0] - max(0, -dx))
+            dst_y = slice(max(0, dy), expanded.shape[1] - max(0, -dy))
+            dst_z = slice(max(0, dz), expanded.shape[2] - max(0, -dz))
+            shifted[dst_x, dst_y, dst_z] = expanded[src_x, src_y, src_z]
+            grown |= shifted
+        expanded = grown
+    return expanded
+
+
 def create_axis_labels(
     image: vtk.vtkImageData,
     xlines: np.ndarray,
@@ -1106,6 +1173,204 @@ class CopyControlPointValuesDialog(QtWidgets.QDialog):
         if horizon_name is None or attribute_name is None:
             return None
         return str(horizon_name), str(attribute_name)
+
+
+class InterpolateVolumeDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        attribute_names: list[str],
+        horizon_names: list[str],
+        selected_attribute_name: str | None = None,
+        selected_horizon_name: str | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Interpolate Attribute Volume")
+        self.setModal(True)
+        layout = QtWidgets.QVBoxLayout(self)
+
+        form = QtWidgets.QFormLayout()
+
+        self.attribute_combo = QtWidgets.QComboBox()
+        for name in attribute_names:
+            self.attribute_combo.addItem(name, name)
+        if selected_attribute_name is not None:
+            index = self.attribute_combo.findData(selected_attribute_name)
+            if index >= 0:
+                self.attribute_combo.setCurrentIndex(index)
+        form.addRow("Grid Attribute", self.attribute_combo)
+
+        self.horizon_combo = QtWidgets.QComboBox()
+        for name in horizon_names:
+            self.horizon_combo.addItem(name, name)
+        if selected_horizon_name is not None:
+            index = self.horizon_combo.findData(selected_horizon_name)
+            if index >= 0:
+                self.horizon_combo.setCurrentIndex(index)
+        form.addRow("Value Horizon", self.horizon_combo)
+
+        self.output_name_edit = QtWidgets.QLineEdit()
+        self.mask_checkbox = QtWidgets.QCheckBox("Mask By Horizon")
+        self.mask_checkbox.setChecked(True)
+        self.idw_radius_edit = QtWidgets.QLineEdit("0")
+        self.idw_radius_edit.setValidator(QtGui.QDoubleValidator(0.0, 1e12, 6, self))
+        form.addRow("Output Name", self.output_name_edit)
+        form.addRow("IDW Radius", self.idw_radius_edit)
+        form.addRow("", self.mask_checkbox)
+        layout.addLayout(form)
+
+        self.attribute_combo.currentIndexChanged.connect(self._update_default_name)
+        self.horizon_combo.currentIndexChanged.connect(self._update_default_name)
+        self._update_default_name()
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _update_default_name(self) -> None:
+        attribute_name = self.attribute_combo.currentData()
+        horizon_name = self.horizon_combo.currentData()
+        if attribute_name is None or horizon_name is None:
+            return
+        if not self.output_name_edit.text().strip():
+            self.output_name_edit.setText(f"{attribute_name}_{horizon_name}_interp")
+
+    def values(self) -> tuple[str, str, str, float, bool] | None:
+        attribute_name = self.attribute_combo.currentData()
+        horizon_name = self.horizon_combo.currentData()
+        if attribute_name is None or horizon_name is None:
+            return None
+        output_name = self.output_name_edit.text().strip()
+        if not output_name:
+            output_name = f"{attribute_name}_{horizon_name}_interp"
+        radius_text = self.idw_radius_edit.text().strip()
+        try:
+            radius = 0.0 if not radius_text else max(0.0, float(radius_text))
+        except ValueError:
+            return None
+        return str(attribute_name), str(horizon_name), str(output_name), float(radius), bool(self.mask_checkbox.isChecked())
+
+
+class ExtractCurrentHorizonMaskDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        horizon_name: str,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Extract Horizon Mask")
+        self.setModal(True)
+        layout = QtWidgets.QVBoxLayout(self)
+
+        form = QtWidgets.QFormLayout()
+        self.horizon_label = QtWidgets.QLabel(horizon_name)
+        self.output_name_edit = QtWidgets.QLineEdit(f"{horizon_name}_mask")
+        form.addRow("Horizon", self.horizon_label)
+        form.addRow("Output Name", self.output_name_edit)
+        layout.addLayout(form)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> str | None:
+        output_name = self.output_name_edit.text().strip()
+        if not output_name:
+            return None
+        return output_name
+
+
+class ReplaceVolumeByHorizonDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        attribute_names: list[str],
+        horizon_names: list[str],
+        selected_target_attribute_name: str | None = None,
+        selected_source_attribute_name: str | None = None,
+        selected_horizon_name: str | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Replace By Horizon Mask")
+        self.setModal(True)
+        layout = QtWidgets.QVBoxLayout(self)
+
+        form = QtWidgets.QFormLayout()
+
+        self.target_attribute_combo = QtWidgets.QComboBox()
+        for name in attribute_names:
+            self.target_attribute_combo.addItem(name, name)
+        if selected_target_attribute_name is not None:
+            index = self.target_attribute_combo.findData(selected_target_attribute_name)
+            if index >= 0:
+                self.target_attribute_combo.setCurrentIndex(index)
+        form.addRow("Target Attribute", self.target_attribute_combo)
+
+        self.source_attribute_combo = QtWidgets.QComboBox()
+        for name in attribute_names:
+            self.source_attribute_combo.addItem(name, name)
+        if selected_source_attribute_name is not None:
+            index = self.source_attribute_combo.findData(selected_source_attribute_name)
+            if index >= 0:
+                self.source_attribute_combo.setCurrentIndex(index)
+        elif self.source_attribute_combo.count() > 1:
+            self.source_attribute_combo.setCurrentIndex(1)
+        form.addRow("Source Attribute", self.source_attribute_combo)
+
+        self.horizon_combo = QtWidgets.QComboBox()
+        for name in horizon_names:
+            self.horizon_combo.addItem(name, name)
+        if selected_horizon_name is not None:
+            index = self.horizon_combo.findData(selected_horizon_name)
+            if index >= 0:
+                self.horizon_combo.setCurrentIndex(index)
+        form.addRow("Horizon", self.horizon_combo)
+
+        self.output_name_edit = QtWidgets.QLineEdit()
+        form.addRow("Output Name", self.output_name_edit)
+        layout.addLayout(form)
+
+        self.target_attribute_combo.currentIndexChanged.connect(self._update_default_name)
+        self.source_attribute_combo.currentIndexChanged.connect(self._update_default_name)
+        self.horizon_combo.currentIndexChanged.connect(self._update_default_name)
+        self._update_default_name()
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _update_default_name(self) -> None:
+        if self.output_name_edit.text().strip():
+            return
+        target_name = self.target_attribute_combo.currentData()
+        source_name = self.source_attribute_combo.currentData()
+        horizon_name = self.horizon_combo.currentData()
+        if target_name is None or source_name is None or horizon_name is None:
+            return
+        self.output_name_edit.setText(f"{target_name}_replaced_by_{source_name}_{horizon_name}")
+
+    def values(self) -> tuple[str, str, str, str] | None:
+        target_name = self.target_attribute_combo.currentData()
+        source_name = self.source_attribute_combo.currentData()
+        horizon_name = self.horizon_combo.currentData()
+        output_name = self.output_name_edit.text().strip()
+        if target_name is None or source_name is None or horizon_name is None:
+            return None
+        if not output_name:
+            output_name = f"{target_name}_replaced_by_{source_name}_{horizon_name}"
+        return str(target_name), str(source_name), str(horizon_name), str(output_name)
 
 
 class LoadSeismicDialog(QtWidgets.QDialog):
@@ -1623,16 +1888,47 @@ class SliceUpdater:
             return None
         return attribute.volume_data
 
+    @staticmethod
+    def _control_point_value_stats(points: list[ControlPoint]) -> tuple[float, float]:
+        values = np.asarray([float(point.value) for point in points], dtype=np.float32)
+        if values.size == 0:
+            return (0.0, 1.0)
+        minimum = float(np.min(values))
+        maximum = float(np.max(values))
+        if minimum == maximum:
+            maximum = minimum + 1.0
+        return minimum, maximum
+
+    def _build_control_point_value_lut_from_values(
+        self,
+        points: list[ControlPoint],
+        colormap_name: str,
+        value_range: tuple[float, float] | None,
+    ) -> vtk.vtkLookupTable:
+        actual_range = self._control_point_value_stats(points) if value_range is None else value_range
+        lut = vtk.vtkLookupTable()
+        lut.SetRange(float(actual_range[0]), float(actual_range[1]))
+        apply_colormap_preset(lut, colormap_name)
+        return lut
+
     def _control_point_value_lut(self, point_set: ControlPointSet) -> vtk.vtkLookupTable | None:
-        if not point_set.use_attribute_colormap or point_set.value_attribute_name is None:
+        if not point_set.use_attribute_colormap:
             return None
-        attribute = self.attributes.get(point_set.value_attribute_name)
-        if attribute is None:
-            return None
-        return attribute.lut
+        return self._build_control_point_value_lut_from_values(
+            point_set.points,
+            point_set.value_colormap_name,
+            point_set.value_color_range,
+        )
 
     def _refresh_control_point_values(self, point_set: ControlPointSet) -> None:
         value_volume_data = self._control_point_value_volume_data(point_set)
+        self._apply_value_volume_to_control_points(point_set, value_volume_data)
+
+    def _apply_value_volume_to_control_points(
+        self,
+        point_set: ControlPointSet,
+        value_volume_data: VolumeData | None,
+    ) -> None:
         refreshed_points: list[ControlPoint] = []
         for point in point_set.points:
             value = (
@@ -1707,6 +2003,39 @@ class SliceUpdater:
             return False
         return self._apply_control_point_deformation_to_horizon(current_horizon.name, point_set)
 
+    def _rebuild_current_mask_from_control_points(
+        self,
+        horizon: HorizonSurface,
+        point_set: ControlPointSet,
+    ) -> np.ndarray | None:
+        reference_mask = np.asarray(point_set.original_horizon_mask, dtype=bool)
+        if reference_mask.ndim != 3 or reference_mask.size == 0:
+            return None
+        rebuilt_mask = None
+        try:
+            rebuilt_mask = rebuild_mask_from_master_points(
+                reference_mask.shape,
+                point_set.points,
+                reference_mask,
+            )
+        except Exception:
+            rebuilt_mask = None
+
+        surface_mask = None
+        try:
+            surface_mask = polydata_to_mask(horizon.polydata, reference_mask.shape, self.spacing, dilate_steps=1)
+        except Exception:
+            surface_mask = None
+
+        combined_mask = np.zeros(reference_mask.shape, dtype=bool)
+        if rebuilt_mask is not None:
+            combined_mask |= np.asarray(rebuilt_mask, dtype=bool)
+        if surface_mask is not None:
+            combined_mask |= np.asarray(surface_mask, dtype=bool)
+        if not np.any(combined_mask):
+            return None
+        return combined_mask
+
     def _apply_control_point_deformation_to_horizon(self, horizon_name: str, point_set: ControlPointSet) -> bool:
         horizon = self.horizons.get(horizon_name)
         if horizon is None:
@@ -1734,6 +2063,9 @@ class SliceUpdater:
         horizon.lut = lut
         horizon.scalar_range = scalar_range
         horizon.actor.GetProperty().SetColor(*horizon.color)
+        rebuilt_mask = self._rebuild_current_mask_from_control_points(horizon, point_set)
+        if rebuilt_mask is not None:
+            horizon.component_mask = rebuilt_mask
         horizon.actor.SetVisibility(horizon.visible)
         return True
 
@@ -1801,6 +2133,8 @@ class SliceUpdater:
         use_attribute_colormap: bool,
         source_horizon_name: str,
         original_horizon_mask: np.ndarray,
+        value_colormap_name: str = DEFAULT_COLORMAP_NAME,
+        value_color_range: tuple[float, float] | None = None,
         display_scale: float = 1.0,
         link_radius: float | None = None,
         visible: bool = True,
@@ -1822,9 +2156,15 @@ class SliceUpdater:
             points,
             self.spacing,
             display_scale=display_scale,
-            value_lut=None
-            if not use_attribute_colormap or value_attribute_name is None or value_attribute_name not in self.attributes
-            else self.attributes[value_attribute_name].lut,
+            value_lut=(
+                None
+                if not use_attribute_colormap
+                else self._build_control_point_value_lut_from_values(
+                    points,
+                    value_colormap_name,
+                    value_color_range,
+                )
+            ),
             use_attribute_colormap=use_attribute_colormap,
         )
         return ControlPointSet(
@@ -1851,6 +2191,12 @@ class SliceUpdater:
             use_attribute_colormap=bool(use_attribute_colormap),
             source_horizon_name=source_horizon_name,
             original_horizon_mask=np.array(original_horizon_mask, copy=True),
+            value_colormap_name=value_colormap_name,
+            value_color_range=(
+                self._control_point_value_stats(points)
+                if value_color_range is None
+                else (float(value_color_range[0]), float(value_color_range[1]))
+            ),
             display_scale=float(display_scale),
             link_radius=float(
                 (8.0 * min(self.spacing.xline, self.spacing.inline)) if link_radius is None else link_radius
@@ -1888,6 +2234,8 @@ class SliceUpdater:
         use_attribute_colormap: bool,
         source_horizon_name: str,
         original_horizon_mask: np.ndarray,
+        value_colormap_name: str = DEFAULT_COLORMAP_NAME,
+        value_color_range: tuple[float, float] | None = None,
         display_scale: float = 1.0,
         link_radius: float | None = None,
         visible: bool = True,
@@ -1905,6 +2253,8 @@ class SliceUpdater:
             samples=samples,
             value_attribute_name=value_attribute_name,
             use_attribute_colormap=use_attribute_colormap,
+            value_colormap_name=value_colormap_name,
+            value_color_range=value_color_range,
             source_horizon_name=source_horizon_name,
             original_horizon_mask=original_horizon_mask,
             display_scale=display_scale,
@@ -1968,12 +2318,9 @@ class SliceUpdater:
 
     def current_control_point_colormap_name(self) -> str | None:
         point_set = self.current_control_point_set()
-        if point_set is None or point_set.value_attribute_name is None:
+        if point_set is None:
             return None
-        attribute = self.attributes.get(point_set.value_attribute_name)
-        if attribute is None:
-            return None
-        return attribute.colormap_name
+        return point_set.value_colormap_name
 
     def current_control_point_use_attribute_colormap(self) -> bool:
         point_set = self.current_control_point_set()
@@ -1983,12 +2330,9 @@ class SliceUpdater:
 
     def current_control_point_colormap_range(self) -> tuple[float, float] | None:
         point_set = self.current_control_point_set()
-        if point_set is None or point_set.value_attribute_name is None:
+        if point_set is None:
             return None
-        attribute = self.attributes.get(point_set.value_attribute_name)
-        if attribute is None:
-            return None
-        return tuple(float(v) for v in attribute.lut.GetRange())
+        return point_set.value_color_range or self._control_point_value_stats(point_set.points)
 
     def set_control_point_display_scale(self, scale: float, render: bool = True) -> None:
         point_set = self.current_control_point_set()
@@ -2058,13 +2402,142 @@ class SliceUpdater:
         if attribute_name not in self.attributes:
             return False
         point_set = horizon.control_point_set
-        point_set.value_attribute_name = attribute_name
-        self._refresh_control_point_values(point_set)
+        attribute = self.attributes[attribute_name]
+        self._apply_value_volume_to_control_points(point_set, attribute.volume_data)
+        # Copy values once, then detach from the source attribute.
+        point_set.value_attribute_name = None
+        point_set.use_attribute_colormap = False
         self._refresh_control_point_set_actor(point_set)
         self.set_current_horizon(self.current_horizon_name, render=False)
         if render:
             self.interactor.GetRenderWindow().Render()
         return True
+
+    def interpolate_attribute_from_control_points(
+        self,
+        attribute_name: str,
+        horizon_name: str,
+        output_name: str,
+        *,
+        idw_radius: float,
+        apply_mask: bool,
+    ) -> str | None:
+        self.last_rebuild_error = None
+        attribute = self.attributes.get(attribute_name)
+        if attribute is None:
+            self.last_rebuild_error = "The selected attribute grid is missing."
+            return None
+        horizon = self.horizons.get(horizon_name)
+        if horizon is None or horizon.control_point_set is None:
+            self.last_rebuild_error = "The selected horizon does not contain control points."
+            return None
+        point_set = horizon.control_point_set
+        mask = horizon.component_mask
+        if apply_mask:
+            current_mask = self._rebuild_current_mask_from_control_points(horizon, point_set)
+            if current_mask is not None:
+                mask = current_mask
+        try:
+            output_volume = interpolate_control_point_values_to_volume(
+                attribute.volume_data,
+                point_set.points,
+                apply_mask=bool(apply_mask),
+                mask=mask,
+                radius=float(idw_radius),
+                name=output_name,
+            )
+        except ValueError as exc:
+            self.last_rebuild_error = str(exc)
+            return None
+        source_opacity = float(attribute.opacity)
+        return self.add_attribute_volume(output_volume, name=output_name, opacity=source_opacity, select=True)
+
+    def extract_mask_from_current_horizon(self, output_name: str) -> str | None:
+        self.last_rebuild_error = None
+        horizon = self.current_horizon()
+        if horizon is None:
+            self.last_rebuild_error = "No current horizon is selected."
+            return None
+        if horizon.xlines is None or horizon.inlines is None or horizon.samples is None:
+            self.last_rebuild_error = "The current horizon grid is incomplete."
+            return None
+        mask = horizon.component_mask
+        if horizon.control_point_set is not None:
+            current_mask = self._rebuild_current_mask_from_control_points(horizon, horizon.control_point_set)
+            if current_mask is not None:
+                mask = current_mask
+        if mask is None:
+            self.last_rebuild_error = "The current horizon mask is missing."
+            return None
+        output_volume = VolumeData(
+            data=np.asarray(mask, dtype=np.float32),
+            xlines=np.array(horizon.xlines, copy=True),
+            inlines=np.array(horizon.inlines, copy=True),
+            samples=np.array(horizon.samples, copy=True),
+            name=output_name,
+            metadata={
+                "operation": "extract_horizon_mask",
+                "source_horizon_name": horizon.name,
+            },
+        )
+        return self.add_attribute_volume(output_volume, name=output_name, opacity=0.9, select=True)
+
+    def replace_attribute_by_horizon_mask(
+        self,
+        target_attribute_name: str,
+        source_attribute_name: str,
+        horizon_name: str,
+        output_name: str,
+    ) -> str | None:
+        self.last_rebuild_error = None
+        target_attribute = self.attributes.get(target_attribute_name)
+        if target_attribute is None:
+            self.last_rebuild_error = "The target attribute is missing."
+            return None
+        source_attribute = self.attributes.get(source_attribute_name)
+        if source_attribute is None:
+            self.last_rebuild_error = "The source attribute is missing."
+            return None
+        if target_attribute.volume_data.shape != source_attribute.volume_data.shape:
+            self.last_rebuild_error = "The two attribute volumes do not share the same grid shape."
+            return None
+        horizon = self.horizons.get(horizon_name)
+        if horizon is None:
+            self.last_rebuild_error = "The selected horizon is missing."
+            return None
+
+        mask = horizon.component_mask
+        if horizon.control_point_set is not None:
+            current_mask = self._rebuild_current_mask_from_control_points(horizon, horizon.control_point_set)
+            if current_mask is not None:
+                mask = current_mask
+        if mask is None:
+            self.last_rebuild_error = "The selected horizon mask is missing."
+            return None
+        mask_array = np.asarray(mask, dtype=bool)
+        if mask_array.shape != target_attribute.volume_data.shape:
+            self.last_rebuild_error = "The horizon mask shape does not match the selected attributes."
+            return None
+
+        output_data = np.array(target_attribute.volume_data.data, copy=True)
+        output_data[mask_array] = np.asarray(source_attribute.volume_data.data, dtype=np.float32)[mask_array]
+        output_volume = target_attribute.volume_data.with_data(
+            output_data,
+            name=output_name,
+            metadata={
+                **target_attribute.volume_data.metadata,
+                "operation": "replace_by_horizon_mask",
+                "target_attribute_name": target_attribute_name,
+                "source_attribute_name": source_attribute_name,
+                "source_horizon_name": horizon_name,
+            },
+        )
+        return self.add_attribute_volume(
+            output_volume,
+            name=output_name,
+            opacity=float(target_attribute.opacity),
+            select=True,
+        )
 
     def set_control_point_use_attribute_colormap(self, enabled: bool, render: bool = True) -> None:
         point_set = self.current_control_point_set()
@@ -2078,34 +2551,24 @@ class SliceUpdater:
 
     def set_control_point_colormap(self, colormap_name: str, render: bool = True) -> None:
         point_set = self.current_control_point_set()
-        if point_set is None or point_set.value_attribute_name is None:
+        if point_set is None:
             return
-        attribute = self.attributes.get(point_set.value_attribute_name)
-        if attribute is None:
-            return
-        self._set_attribute_colormap(attribute, colormap_name)
+        point_set.value_colormap_name = (
+            colormap_name if colormap_name in available_colormap_names() else DEFAULT_COLORMAP_NAME
+        )
         self._refresh_control_point_set_actor(point_set)
-        if self.current_attribute_name == attribute.name:
-            for bundle in self.bundles.values():
-                bundle.mapper.Update()
         self.refresh_scalar_bar()
         if render:
             self.interactor.GetRenderWindow().Render()
 
     def set_control_point_colormap_range(self, min_value: float, max_value: float, render: bool = True) -> None:
         point_set = self.current_control_point_set()
-        if point_set is None or point_set.value_attribute_name is None:
+        if point_set is None:
             return
         if min_value > max_value:
             min_value, max_value = max_value, min_value
-        attribute = self.attributes.get(point_set.value_attribute_name)
-        if attribute is None:
-            return
-        attribute.lut.SetRange(float(min_value), float(max_value))
-        attribute.lut.Build()
-        if self.current_attribute_name == point_set.value_attribute_name:
-            for bundle in self.bundles.values():
-                bundle.mapper.Update()
+        point_set.value_color_range = (float(min_value), float(max_value))
+        self._refresh_control_point_set_actor(point_set)
         self.refresh_scalar_bar()
         if render:
             self.interactor.GetRenderWindow().Render()
@@ -2133,12 +2596,9 @@ class SliceUpdater:
         if (
             point_set is not None
             and point_set.use_attribute_colormap
-            and point_set.value_attribute_name is not None
-            and point_set.value_attribute_name in self.attributes
         ):
-            attribute = self.attributes[point_set.value_attribute_name]
-            lut = attribute.lut
-            title = f"Control Points\n{attribute.name}"
+            lut = self._control_point_value_lut(point_set)
+            title = "Control Points\nValue"
         else:
             attribute = self.current_attribute()
             if attribute is not None:
@@ -2232,6 +2692,18 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.extract_control_points_button.clicked.connect(self.open_extract_control_points_dialog)
         panel_layout.addWidget(self.extract_control_points_button)
 
+        self.interpolate_volume_button = QtWidgets.QPushButton("Interpolate Volume")
+        self.interpolate_volume_button.clicked.connect(self.open_interpolate_volume_dialog)
+        panel_layout.addWidget(self.interpolate_volume_button)
+
+        self.extract_horizon_mask_button = QtWidgets.QPushButton("Extract Horizon Mask")
+        self.extract_horizon_mask_button.clicked.connect(self.open_extract_horizon_mask_dialog)
+        panel_layout.addWidget(self.extract_horizon_mask_button)
+
+        self.replace_volume_button = QtWidgets.QPushButton("Replace By Horizon")
+        self.replace_volume_button.clicked.connect(self.open_replace_volume_dialog)
+        panel_layout.addWidget(self.replace_volume_button)
+
         attribute_display_group = ColorMapControlWidget("Attribute Colormap")
         self.attribute_colormap_widget = attribute_display_group
         self.attribute_colormap_widget.apply_button.clicked.connect(self.apply_attribute_display)
@@ -2318,11 +2790,10 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.copy_control_point_values_button = QtWidgets.QPushButton("Copy Values")
         self.copy_control_point_values_button.clicked.connect(self.open_copy_control_point_values_dialog)
         control_point_value_row.addWidget(self.copy_control_point_values_button)
-        self.control_point_value_attribute_label = QtWidgets.QLabel("Value Attr: none")
-        control_point_value_row.addWidget(self.control_point_value_attribute_label, stretch=1)
+        control_point_value_row.addStretch(1)
         control_point_tools_layout.addLayout(control_point_value_row)
 
-        self.control_point_use_colormap_checkbox = QtWidgets.QCheckBox("Use Attribute Colormap")
+        self.control_point_use_colormap_checkbox = QtWidgets.QCheckBox("Use Value Colormap")
         self.control_point_use_colormap_checkbox.toggled.connect(self.toggle_control_point_colormap)
         control_point_tools_layout.addWidget(self.control_point_use_colormap_checkbox)
 
@@ -2497,8 +2968,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.copy_control_point_values_button.setEnabled(bool(self.updater.attribute_names()) and any(
             horizon.control_point_set is not None for horizon in self.updater.horizons.values()
         ))
-        has_value_attribute = self.updater.current_control_point_value_attribute_name() is not None
-        self.control_point_use_colormap_checkbox.setEnabled(has_control_points and has_value_attribute)
+        self.control_point_use_colormap_checkbox.setEnabled(has_control_points)
         self.control_point_smoothness_slider.setEnabled(has_control_points)
         has_selected_master = has_control_points and self._selected_master_point_index is not None
         self.move_master_up_button.setEnabled(has_selected_master)
@@ -2521,14 +2991,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             int(round((min_spacing if link_radius is None else link_radius) / max(min_spacing, 1e-6)))
         )
         self.control_point_link_radius_slider.blockSignals(False)
-        selected_value_attribute = self.updater.current_control_point_value_attribute_name()
-        self.control_point_value_attribute_label.setText(
-            f"Value Attr: {selected_value_attribute or 'none'}"
-        )
         self.control_point_use_colormap_checkbox.blockSignals(True)
-        self.control_point_use_colormap_checkbox.setChecked(
-            has_value_attribute and self.updater.current_control_point_use_attribute_colormap()
-        )
+        self.control_point_use_colormap_checkbox.setChecked(self.updater.current_control_point_use_attribute_colormap())
         self.control_point_use_colormap_checkbox.blockSignals(False)
         colormap_range = self.updater.current_control_point_colormap_range()
         has_colormap_attribute = colormap_range is not None
@@ -2547,6 +3011,11 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
 
         self.extract_button.setEnabled(has_attribute)
         self.extract_envelope_button.setEnabled(has_attribute)
+        self.interpolate_volume_button.setEnabled(
+            has_attribute and any(horizon.control_point_set is not None for horizon in self.updater.horizons.values())
+        )
+        self.extract_horizon_mask_button.setEnabled(self.updater.current_horizon() is not None)
+        self.replace_volume_button.setEnabled(has_attribute and self.updater.current_horizon() is not None)
         self.reset_view_button.setEnabled(has_attribute)
 
     def refresh_data_panel(self) -> None:
@@ -3096,6 +3565,14 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                     use_attribute_colormap=bool(
                         int(np.asarray(payload.get("control_point_use_attribute_colormap", np.array([0], dtype=np.uint8))).ravel()[0])
                     ),
+                    value_colormap_name=str(
+                        self._payload_scalar(payload.get("control_point_value_colormap_name", np.array(DEFAULT_COLORMAP_NAME)))
+                    ),
+                    value_color_range=(
+                        tuple(np.asarray(payload["control_point_value_color_range"], dtype=np.float32).ravel()[:2])
+                        if "control_point_value_color_range" in payload
+                        else None
+                    ),
                     source_horizon_name=str(self._payload_scalar(payload.get("control_point_source_horizon_name", np.array(name)))),
                     original_horizon_mask=np.asarray(
                         payload.get("control_point_original_horizon_mask", payload["component_mask"]),
@@ -3184,6 +3661,11 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                             ),
                             "control_point_use_attribute_colormap": np.array(
                                 [1 if point_set.use_attribute_colormap else 0], dtype=np.uint8
+                            ),
+                            "control_point_value_colormap_name": np.array(point_set.value_colormap_name),
+                            "control_point_value_color_range": np.asarray(
+                                point_set.value_color_range if point_set.value_color_range is not None else (0.0, 1.0),
+                                dtype=np.float32,
                             ),
                             "control_point_visible": np.array([1 if point_set.visible else 0], dtype=np.uint8),
                             "control_point_source_horizon_name": np.array(point_set.source_horizon_name),
@@ -3286,6 +3768,156 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self._refresh_selected_master_actor()
         self.refresh_data_panel()
         self.refresh_display_controls()
+        self.schedule_render()
+
+    def open_interpolate_volume_dialog(self) -> None:
+        horizon_names = [
+            name
+            for name, horizon in self.updater.horizons.items()
+            if horizon.control_point_set is not None
+        ]
+        attribute_names = self.updater.attribute_names()
+        if not attribute_names:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Attribute",
+                "Load or select an attribute to provide the interpolation grid.",
+            )
+            return
+        if not horizon_names:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Control Points",
+                "Select a horizon that already contains control points.",
+            )
+            return
+        current_horizon_name = (
+            self.updater.current_horizon_name
+            if self.updater.current_horizon_name in horizon_names
+            else horizon_names[0]
+        )
+        dialog = InterpolateVolumeDialog(
+            attribute_names,
+            horizon_names,
+            selected_attribute_name=self.updater.current_attribute_name,
+            selected_horizon_name=current_horizon_name,
+            parent=self,
+        )
+        if dialog.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return
+        values = dialog.values()
+        if values is None:
+            return
+        attribute_name, horizon_name, output_name, idw_radius, apply_mask = values
+        new_name = self.updater.interpolate_attribute_from_control_points(
+            attribute_name,
+            horizon_name,
+            output_name,
+            idw_radius=idw_radius,
+            apply_mask=apply_mask,
+        )
+        if new_name is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Interpolation Failed",
+                self.updater.last_rebuild_error or "Failed to interpolate a new attribute volume.",
+            )
+            return
+        self.image = self.updater.image
+        self._selected_data_item = ("attribute", new_name)
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        self.refresh_info()
+        self.refresh_data_panel()
+        self.schedule_render()
+
+    def open_extract_horizon_mask_dialog(self) -> None:
+        current_horizon = self.updater.current_horizon()
+        if current_horizon is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Horizon",
+                "Select a current horizon before extracting its mask.",
+            )
+            return
+        dialog = ExtractCurrentHorizonMaskDialog(current_horizon.name, self)
+        if dialog.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return
+        output_name = dialog.values()
+        if output_name is None:
+            return
+        new_name = self.updater.extract_mask_from_current_horizon(output_name)
+        if new_name is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Extract Failed",
+                self.updater.last_rebuild_error or "Failed to extract the current horizon mask.",
+            )
+            return
+        self.image = self.updater.image
+        self._selected_data_item = ("attribute", new_name)
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        self.refresh_info()
+        self.refresh_data_panel()
+        self.schedule_render()
+
+    def open_replace_volume_dialog(self) -> None:
+        attribute_names = self.updater.attribute_names()
+        horizon_names = self.updater.horizon_names()
+        if len(attribute_names) < 2:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Need Two Attributes",
+                "Load at least two attributes before using replace.",
+            )
+            return
+        if not horizon_names:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No Horizon",
+                "Load or select a horizon before using replace.",
+            )
+            return
+        current_attribute_name = self.updater.current_attribute_name
+        selected_source_name = None
+        for name in attribute_names:
+            if name != current_attribute_name:
+                selected_source_name = name
+                break
+        dialog = ReplaceVolumeByHorizonDialog(
+            attribute_names,
+            horizon_names,
+            selected_target_attribute_name=current_attribute_name,
+            selected_source_attribute_name=selected_source_name,
+            selected_horizon_name=self.updater.current_horizon_name,
+            parent=self,
+        )
+        if dialog.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return
+        values = dialog.values()
+        if values is None:
+            return
+        target_name, source_name, horizon_name, output_name = values
+        new_name = self.updater.replace_attribute_by_horizon_mask(
+            target_name,
+            source_name,
+            horizon_name,
+            output_name,
+        )
+        if new_name is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Replace Failed",
+                self.updater.last_rebuild_error or "Failed to replace attribute values by horizon mask.",
+            )
+            return
+        self.image = self.updater.image
+        self._selected_data_item = ("attribute", new_name)
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        self.refresh_info()
+        self.refresh_data_panel()
         self.schedule_render()
 
     def toggle_control_point_colormap(self, checked: bool) -> None:
