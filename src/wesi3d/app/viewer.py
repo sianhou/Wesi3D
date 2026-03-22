@@ -149,6 +149,7 @@ class ScatterDataSet:
     value_range: tuple[float, float]
     inlines: np.ndarray
     crosslines: np.ndarray
+    z_values: np.ndarray
     values: np.ndarray
     source_path: Path
     visible: bool = True
@@ -160,8 +161,12 @@ class PolygonDataSet:
     actor: vtk.vtkActor
     polydata: vtk.vtkPolyData
     mapper: vtk.vtkPolyDataMapper
+    point_actor: vtk.vtkActor
+    point_polydata: vtk.vtkPolyData
+    point_mapper: vtk.vtkPolyDataMapper
     color_rgb: tuple[int, int, int]
-    rw_points: np.ndarray
+    grid_points: np.ndarray
+    z_values: np.ndarray
     source_path: Path
     visible: bool = True
 
@@ -208,51 +213,6 @@ class GridDefinition:
 GEOMAP_POINT0 = (517888.79, 4598260.61, 2000.0, 1200.0)
 GEOMAP_POINT1 = (501208.58, 4636806.30, 2000.0, 3300.0)
 GEOMAP_POINT3 = (554598.98, 4614146.52, 4000.0, 1200.0)
-
-
-def _geomap_vec(start_xy: tuple[float, float], end_xy: tuple[float, float]) -> tuple[float, float]:
-    return (float(end_xy[0]) - float(start_xy[0]), float(end_xy[1]) - float(start_xy[1]))
-
-
-def _geomap_dot(left: tuple[float, float], right: tuple[float, float]) -> float:
-    return float(left[0] * right[0] + left[1] * right[1])
-
-
-def _geomap_norm(vec: tuple[float, float]) -> float:
-    return float(np.hypot(vec[0], vec[1]))
-
-
-def default_geomap_grid_parameters() -> dict[str, object]:
-    point0_xy = (GEOMAP_POINT0[0], GEOMAP_POINT0[1])
-    point1_xy = (GEOMAP_POINT1[0], GEOMAP_POINT1[1])
-    point3_xy = (GEOMAP_POINT3[0], GEOMAP_POINT3[1])
-    vec_inl = _geomap_vec(point0_xy, point3_xy)
-    vec_cxl = _geomap_vec(point0_xy, point1_xy)
-    len_inl = _geomap_norm(vec_inl)
-    len_cxl = _geomap_norm(vec_cxl)
-    span_inl = GEOMAP_POINT3[2] - GEOMAP_POINT0[2]
-    span_cxl = GEOMAP_POINT1[3] - GEOMAP_POINT0[3]
-    inl_unit = (vec_inl[0] / len_inl, vec_inl[1] / len_inl)
-    cxl_unit = (vec_cxl[0] / len_cxl, vec_cxl[1] / len_cxl)
-    return {
-        "point0_xy": point0_xy,
-        "point0_inl": GEOMAP_POINT0[2],
-        "point0_cxl": GEOMAP_POINT0[3],
-        "step_inl": len_inl / abs(span_inl),
-        "step_cxl": len_cxl / abs(span_cxl),
-        "inl_unit": inl_unit,
-        "cxl_unit": cxl_unit,
-    }
-
-
-def geomap_grid_from_rw(rw_x: float, rw_y: float) -> tuple[float, float]:
-    grid = default_geomap_grid_parameters()
-    rel = _geomap_vec(grid["point0_xy"], (float(rw_x), float(rw_y)))
-    dist_inl = _geomap_dot(rel, grid["inl_unit"])
-    dist_cxl = _geomap_dot(rel, grid["cxl_unit"])
-    inl = float(grid["point0_inl"]) + dist_inl / float(grid["step_inl"])
-    cxl = float(grid["point0_cxl"]) + dist_cxl / float(grid["step_cxl"])
-    return float(inl), float(cxl)
 
 
 def default_geomap_grid_definition() -> GridDefinition:
@@ -549,21 +509,23 @@ def create_scatter_actor(
     crosslines: np.ndarray,
     values: np.ndarray,
     *,
+    z_values: np.ndarray | None = None,
     colormap_name: str = DEFAULT_COLORMAP_NAME,
 ) -> tuple[vtk.vtkActor, vtk.vtkPolyData, vtk.vtkPolyDataMapper, vtk.vtkLookupTable, tuple[float, float]]:
     inline_array = np.asarray(inlines, dtype=np.float32).ravel()
     crossline_array = np.asarray(crosslines, dtype=np.float32).ravel()
     value_array = np.asarray(values, dtype=np.float32).ravel()
+    z_array = np.zeros_like(value_array, dtype=np.float32) if z_values is None else np.asarray(z_values, dtype=np.float32).ravel()
     if not (inline_array.size and crossline_array.size and value_array.size):
         raise ValueError("Scatter file is empty.")
-    if not (inline_array.size == crossline_array.size == value_array.size):
+    if not (inline_array.size == crossline_array.size == value_array.size == z_array.size):
         raise ValueError("Scatter columns must have the same length.")
 
     points_xyz = np.column_stack(
         [
             crossline_array,
             inline_array,
-            np.zeros_like(value_array, dtype=np.float32),
+            z_array,
         ]
     ).astype(np.float32, copy=False)
 
@@ -641,64 +603,282 @@ def load_geomap_polygons(path: Path) -> list[tuple[tuple[int, int, int], np.ndar
     return polygons
 
 
-def polygon_intersects_grid(polygon_rw: np.ndarray, grid_definition: GridDefinition) -> bool:
+def polygon_intersects_grid(polygon_points: np.ndarray, grid_definition: GridDefinition) -> bool:
     inline_min = min(float(grid_definition.inline_start), float(grid_definition.inline_end))
     inline_max = max(float(grid_definition.inline_start), float(grid_definition.inline_end))
     crossline_min = min(float(grid_definition.crossline_start), float(grid_definition.crossline_end))
     crossline_max = max(float(grid_definition.crossline_start), float(grid_definition.crossline_end))
-    for rw_point in np.asarray(polygon_rw, dtype=np.float32):
-        inl, cxl = geomap_grid_from_rw(float(rw_point[0]), float(rw_point[1]))
+    for point in np.asarray(polygon_points, dtype=np.float32):
+        inl = float(point[0])
+        cxl = float(point[1])
         if inline_min <= inl <= inline_max and crossline_min <= cxl <= crossline_max:
             return True
     return False
 
 
-def normalize_polygon_rw_points(polygon_rw: np.ndarray) -> np.ndarray:
-    points = np.asarray(polygon_rw, dtype=np.float32)
-    if points.shape[0] >= 2 and np.allclose(points[0], points[-1]):
-        return np.asarray(points[:-1], dtype=np.float32)
-    return points
+def normalize_polygon_grid_points(polygon_points: np.ndarray) -> np.ndarray:
+    points = np.asarray(polygon_points, dtype=np.float32).reshape(-1, 2)
+    if points.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    deduplicated: list[np.ndarray] = []
+    for point in points:
+        if not deduplicated or not np.allclose(point, deduplicated[-1]):
+            deduplicated.append(point)
+    normalized = np.asarray(deduplicated, dtype=np.float32)
+
+    while normalized.shape[0] >= 2 and np.allclose(normalized[0], normalized[-1]):
+        normalized = np.asarray(normalized[:-1], dtype=np.float32)
+
+    # Remove a repeated suffix that duplicates the polygon prefix using a
+    # prefix-function scan instead of quadratic tail searching.
+    while normalized.shape[0] >= 3:
+        point_keys = [tuple(float(value) for value in point) for point in normalized]
+        prefix_lengths = [0] * len(point_keys)
+        for index in range(1, len(point_keys)):
+            prefix_length = prefix_lengths[index - 1]
+            while prefix_length > 0 and point_keys[index] != point_keys[prefix_length]:
+                prefix_length = prefix_lengths[prefix_length - 1]
+            if point_keys[index] == point_keys[prefix_length]:
+                prefix_length += 1
+            prefix_lengths[index] = prefix_length
+        repeated_suffix_length = prefix_lengths[-1]
+        if repeated_suffix_length <= 0:
+            break
+        normalized = np.asarray(normalized[:-repeated_suffix_length], dtype=np.float32)
+
+    return np.asarray(normalized, dtype=np.float32)
 
 
-def create_polygon_actor(
+@dataclass
+class ElevSurface:
+    inlines: np.ndarray
+    crosslines: np.ndarray
+    values: np.ndarray
+
+    def sample(self, inline_value: float, crossline_value: float) -> float:
+        inline_axis = np.asarray(self.inlines, dtype=np.float32)
+        crossline_axis = np.asarray(self.crosslines, dtype=np.float32)
+        value_grid = np.asarray(self.values, dtype=np.float32)
+
+        inline_clamped = float(np.clip(inline_value, float(inline_axis[0]), float(inline_axis[-1])))
+        crossline_clamped = float(np.clip(crossline_value, float(crossline_axis[0]), float(crossline_axis[-1])))
+
+        if inline_axis.size == 1:
+            inline_low = inline_high = 0
+            inline_weight = 0.0
+        else:
+            inline_high = int(np.searchsorted(inline_axis, inline_clamped, side="left"))
+            if inline_high <= 0:
+                inline_low, inline_high = 0, 1
+            elif inline_high >= inline_axis.size:
+                inline_low, inline_high = inline_axis.size - 2, inline_axis.size - 1
+            else:
+                inline_low = inline_high - 1
+            inline_span = float(inline_axis[inline_high] - inline_axis[inline_low])
+            inline_weight = 0.0 if abs(inline_span) <= 1e-6 else (inline_clamped - float(inline_axis[inline_low])) / inline_span
+
+        if crossline_axis.size == 1:
+            crossline_low = crossline_high = 0
+            crossline_weight = 0.0
+        else:
+            crossline_high = int(np.searchsorted(crossline_axis, crossline_clamped, side="left"))
+            if crossline_high <= 0:
+                crossline_low, crossline_high = 0, 1
+            elif crossline_high >= crossline_axis.size:
+                crossline_low, crossline_high = crossline_axis.size - 2, crossline_axis.size - 1
+            else:
+                crossline_low = crossline_high - 1
+            crossline_span = float(crossline_axis[crossline_high] - crossline_axis[crossline_low])
+            crossline_weight = (
+                0.0
+                if abs(crossline_span) <= 1e-6
+                else (crossline_clamped - float(crossline_axis[crossline_low])) / crossline_span
+            )
+
+        v00 = float(value_grid[inline_low, crossline_low])
+        v01 = float(value_grid[inline_low, crossline_high])
+        v10 = float(value_grid[inline_high, crossline_low])
+        v11 = float(value_grid[inline_high, crossline_high])
+        top = (1.0 - crossline_weight) * v00 + crossline_weight * v01
+        bottom = (1.0 - crossline_weight) * v10 + crossline_weight * v11
+        return float((1.0 - inline_weight) * top + inline_weight * bottom)
+
+
+def build_elev_surface(inlines: np.ndarray, crosslines: np.ndarray, values: np.ndarray) -> ElevSurface:
+    inline_array = np.asarray(inlines, dtype=np.float32).ravel()
+    crossline_array = np.asarray(crosslines, dtype=np.float32).ravel()
+    value_array = np.asarray(values, dtype=np.float32).ravel()
+    if not (inline_array.size == crossline_array.size == value_array.size):
+        raise ValueError("Elev file columns must have the same length.")
+    inline_axis = np.unique(inline_array)
+    crossline_axis = np.unique(crossline_array)
+    if inline_axis.size * crossline_axis.size != value_array.size:
+        raise ValueError("Elev file must define a full inline/cxline grid.")
+    order = np.lexsort((crossline_array, inline_array))
+    sorted_inlines = inline_array[order]
+    sorted_crosslines = crossline_array[order]
+    if not np.allclose(sorted_inlines.reshape(inline_axis.size, crossline_axis.size), inline_axis[:, None]):
+        raise ValueError("Elev file inline axis is not a regular grid.")
+    if not np.allclose(sorted_crosslines.reshape(inline_axis.size, crossline_axis.size), crossline_axis[None, :]):
+        raise ValueError("Elev file crossline axis is not a regular grid.")
+    value_grid = value_array[order].reshape(inline_axis.size, crossline_axis.size)
+    return ElevSurface(inline_axis, crossline_axis, value_grid)
+
+
+def clip_polygon_to_grid(polygon_points: np.ndarray, grid_definition: GridDefinition) -> np.ndarray:
+    points = normalize_polygon_grid_points(polygon_points)
+    if points.shape[0] < 3:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    inline_min = min(float(grid_definition.inline_start), float(grid_definition.inline_end))
+    inline_max = max(float(grid_definition.inline_start), float(grid_definition.inline_end))
+    crossline_min = min(float(grid_definition.crossline_start), float(grid_definition.crossline_end))
+    crossline_max = max(float(grid_definition.crossline_start), float(grid_definition.crossline_end))
+
+    def inside(point: np.ndarray, edge: str) -> bool:
+        if edge == "left":
+            return float(point[1]) >= crossline_min
+        if edge == "right":
+            return float(point[1]) <= crossline_max
+        if edge == "bottom":
+            return float(point[0]) >= inline_min
+        return float(point[0]) <= inline_max
+
+    def intersect(start: np.ndarray, end: np.ndarray, edge: str) -> np.ndarray:
+        start_inline = float(start[0])
+        start_crossline = float(start[1])
+        end_inline = float(end[0])
+        end_crossline = float(end[1])
+        delta_inline = end_inline - start_inline
+        delta_crossline = end_crossline - start_crossline
+
+        if edge == "left":
+            target_crossline = crossline_min
+            t = 0.0 if abs(delta_crossline) <= 1e-6 else (target_crossline - start_crossline) / delta_crossline
+            return np.asarray([start_inline + t * delta_inline, target_crossline], dtype=np.float32)
+        if edge == "right":
+            target_crossline = crossline_max
+            t = 0.0 if abs(delta_crossline) <= 1e-6 else (target_crossline - start_crossline) / delta_crossline
+            return np.asarray([start_inline + t * delta_inline, target_crossline], dtype=np.float32)
+        if edge == "bottom":
+            target_inline = inline_min
+            t = 0.0 if abs(delta_inline) <= 1e-6 else (target_inline - start_inline) / delta_inline
+            return np.asarray([target_inline, start_crossline + t * delta_crossline], dtype=np.float32)
+        target_inline = inline_max
+        t = 0.0 if abs(delta_inline) <= 1e-6 else (target_inline - start_inline) / delta_inline
+        return np.asarray([target_inline, start_crossline + t * delta_crossline], dtype=np.float32)
+
+    clipped = np.asarray(points, dtype=np.float32)
+    for edge in ("left", "right", "bottom", "top"):
+        if clipped.shape[0] == 0:
+            break
+        output: list[np.ndarray] = []
+        for index, end_point in enumerate(clipped):
+            start_point = clipped[index - 1]
+            start_inside = inside(start_point, edge)
+            end_inside = inside(end_point, edge)
+            if start_inside and end_inside:
+                output.append(np.asarray(end_point, dtype=np.float32))
+            elif start_inside and not end_inside:
+                output.append(intersect(start_point, end_point, edge))
+            elif not start_inside and end_inside:
+                output.append(intersect(start_point, end_point, edge))
+                output.append(np.asarray(end_point, dtype=np.float32))
+        clipped = normalize_polygon_grid_points(np.asarray(output, dtype=np.float32)) if output else np.zeros((0, 2), dtype=np.float32)
+    return np.asarray(clipped, dtype=np.float32)
+
+
+def polygon_grid_to_xyz(polygon_points: np.ndarray, z_values: np.ndarray | None = None) -> np.ndarray:
+    normalized_points = normalize_polygon_grid_points(polygon_points)
+    if normalized_points.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    xyz_points = np.zeros((normalized_points.shape[0], 3), dtype=np.float32)
+    z_array = (
+        np.zeros(normalized_points.shape[0], dtype=np.float32)
+        if z_values is None
+        else np.asarray(z_values, dtype=np.float32).ravel()
+    )
+    if z_array.size != normalized_points.shape[0]:
+        raise ValueError("Polygon z values must match polygon point count.")
+    for index, point in enumerate(normalized_points):
+        xyz_points[index] = (float(point[1]), float(point[0]), float(z_array[index]))
+    return xyz_points
+
+
+def create_polygon_actors(
     color_rgb: tuple[int, int, int],
-    polygon_rw: np.ndarray,
-) -> tuple[vtk.vtkActor, vtk.vtkPolyData, vtk.vtkPolyDataMapper]:
-    polygon_rw = normalize_polygon_rw_points(polygon_rw)
-    points = vtk.vtkPoints()
-    lines = vtk.vtkCellArray()
-    colors = vtk.vtkUnsignedCharArray()
-    colors.SetName("color")
-    colors.SetNumberOfComponents(3)
+    polygon_points: np.ndarray,
+    z_values: np.ndarray | None = None,
+) -> tuple[
+    vtk.vtkActor,
+    vtk.vtkPolyData,
+    vtk.vtkPolyDataMapper,
+    vtk.vtkActor,
+    vtk.vtkPolyData,
+    vtk.vtkPolyDataMapper,
+]:
+    polygon_xyz = polygon_grid_to_xyz(polygon_points, z_values=z_values)
+    if polygon_xyz.shape[0] == 0:
+        polygon_xyz = np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32)
 
-    if polygon_rw.shape[0] < 2:
-        polygon_rw = np.asarray([[0.0, 0.0], [0.0, 0.0]], dtype=np.float32)
-    line = vtk.vtkPolyLine()
-    line.GetPointIds().SetNumberOfIds(polygon_rw.shape[0] + 1)
-    for index, rw_point in enumerate(polygon_rw):
-        inl, cxl = geomap_grid_from_rw(float(rw_point[0]), float(rw_point[1]))
-        point_id = points.InsertNextPoint(float(cxl), float(inl), 0.0)
-        line.GetPointIds().SetId(index, point_id)
-    line.GetPointIds().SetId(polygon_rw.shape[0], line.GetPointIds().GetId(0))
-    lines.InsertNextCell(line)
-    colors.InsertNextTuple3(*color_rgb)
+    line_points = vtk.vtkPoints()
+    line_points.SetData(numpy_support.numpy_to_vtk(polygon_xyz, deep=True))
+    lines = vtk.vtkCellArray()
+    point_count = polygon_xyz.shape[0]
+    if point_count >= 2:
+        segment_count = point_count if point_count >= 3 else 1
+        for index in range(segment_count):
+            next_index = (index + 1) % point_count
+            if point_count == 2 and index > 0:
+                break
+            line = vtk.vtkLine()
+            line.GetPointIds().SetId(0, index)
+            line.GetPointIds().SetId(1, next_index)
+            lines.InsertNextCell(line)
 
     polydata = vtk.vtkPolyData()
-    polydata.SetPoints(points)
+    polydata.SetPoints(line_points)
     polydata.SetLines(lines)
-    polydata.GetCellData().SetScalars(colors)
 
     mapper = vtk.vtkPolyDataMapper()
     mapper.SetInputData(polydata)
-    mapper.SetScalarModeToUseCellData()
-    mapper.SetColorModeToDirectScalars()
-    mapper.ScalarVisibilityOn()
+    mapper.ScalarVisibilityOff()
 
     actor = vtk.vtkActor()
     actor.SetMapper(mapper)
     actor.GetProperty().SetLineWidth(2.0)
     actor.GetProperty().SetOpacity(0.95)
-    return actor, polydata, mapper
+    actor.GetProperty().SetColor(
+        float(color_rgb[0]) / 255.0,
+        float(color_rgb[1]) / 255.0,
+        float(color_rgb[2]) / 255.0,
+    )
+
+    point_points = vtk.vtkPoints()
+    point_points.SetData(numpy_support.numpy_to_vtk(polygon_xyz, deep=True))
+    verts = vtk.vtkCellArray()
+    for index in range(point_count):
+        verts.InsertNextCell(1)
+        verts.InsertCellPoint(index)
+
+    point_polydata = vtk.vtkPolyData()
+    point_polydata.SetPoints(point_points)
+    point_polydata.SetVerts(verts)
+
+    point_mapper = vtk.vtkPolyDataMapper()
+    point_mapper.SetInputData(point_polydata)
+    point_mapper.ScalarVisibilityOff()
+
+    point_actor = vtk.vtkActor()
+    point_actor.SetMapper(point_mapper)
+    point_actor.GetProperty().SetRepresentationToPoints()
+    point_actor.GetProperty().RenderPointsAsSpheresOn()
+    point_actor.GetProperty().SetPointSize(11.0)
+    point_actor.GetProperty().SetOpacity(1.0)
+    point_actor.GetProperty().SetColor(1.0, 0.96, 0.35)
+    point_actor.SetVisibility(False)
+    return actor, polydata, mapper, point_actor, point_polydata, point_mapper
 
 
 def create_grid_image(definition: GridDefinition) -> vtk.vtkImageData:
@@ -1865,6 +2045,7 @@ class LoadSeismicDialog(QtWidgets.QDialog):
 class BuildModelWindow(QtWidgets.QDialog):
     define_grid_requested = QtCore.Signal()
     load_dip_direction_requested = QtCore.Signal()
+    load_elev_requested = QtCore.Signal()
     load_geomap_requested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
@@ -1967,6 +2148,24 @@ class BuildModelWindow(QtWidgets.QDialog):
         scatter_layout.addWidget(self.load_dip_direction_button)
         layout.addWidget(self.scatter_group)
 
+        self.elev_group = QtWidgets.QGroupBox("Load Elev")
+        elev_layout = QtWidgets.QVBoxLayout(self.elev_group)
+        elev_layout.setContentsMargins(8, 6, 8, 6)
+        elev_layout.setSpacing(6)
+        elev_row = QtWidgets.QHBoxLayout()
+        elev_row.setSpacing(6)
+        self.elev_path_edit = QtWidgets.QLineEdit()
+        elev_row.addWidget(self.elev_path_edit, stretch=1)
+        self.browse_elev_button = QtWidgets.QPushButton("Browse")
+        self.browse_elev_button.setMaximumWidth(72)
+        self.browse_elev_button.clicked.connect(self._browse_elev_path)
+        elev_row.addWidget(self.browse_elev_button)
+        elev_layout.addLayout(elev_row)
+        self.load_elev_button = QtWidgets.QPushButton("Load Elev")
+        self.load_elev_button.clicked.connect(self.load_elev_requested.emit)
+        elev_layout.addWidget(self.load_elev_button)
+        layout.addWidget(self.elev_group)
+
         self.geomap_group = QtWidgets.QGroupBox("Load Geomap")
         geomap_layout = QtWidgets.QVBoxLayout(self.geomap_group)
         geomap_layout.setContentsMargins(8, 6, 8, 6)
@@ -1980,6 +2179,16 @@ class BuildModelWindow(QtWidgets.QDialog):
         self.browse_geomap_button.clicked.connect(self._browse_geomap_path)
         geomap_row.addWidget(self.browse_geomap_button)
         geomap_layout.addLayout(geomap_row)
+        geomap_elev_row = QtWidgets.QHBoxLayout()
+        geomap_elev_row.setSpacing(6)
+        self.geomap_elev_path_edit = QtWidgets.QLineEdit()
+        geomap_elev_row.addWidget(self.geomap_elev_path_edit, stretch=1)
+        self.browse_geomap_elev_button = QtWidgets.QPushButton("Browse")
+        self.browse_geomap_elev_button.setMaximumWidth(72)
+        self.browse_geomap_elev_button.clicked.connect(self._browse_geomap_elev_path)
+        geomap_elev_row.addWidget(self.browse_geomap_elev_button)
+        geomap_layout.addWidget(QtWidgets.QLabel("Elev File"))
+        geomap_layout.addLayout(geomap_elev_row)
         self.load_geomap_button = QtWidgets.QPushButton("Load Geomap")
         self.load_geomap_button.clicked.connect(self.load_geomap_requested.emit)
         geomap_layout.addWidget(self.load_geomap_button)
@@ -2003,7 +2212,9 @@ class BuildModelWindow(QtWidgets.QDialog):
         self.sample_size_edit.setText(str(self.settings.value("build_model/grid/sample_size", "10")))
         self.dip_path_edit.setText(str(self.settings.value("build_model/scatter/dip_path", "")))
         self.direction_path_edit.setText(str(self.settings.value("build_model/scatter/direction_path", "")))
+        self.elev_path_edit.setText(str(self.settings.value("build_model/elev/path", "")))
         self.geomap_path_edit.setText(str(self.settings.value("build_model/polygon/geomap_path", "")))
+        self.geomap_elev_path_edit.setText(str(self.settings.value("build_model/polygon/elev_path", "")))
 
     def save_grid_history(self, definition: GridDefinition) -> None:
         self.settings.setValue("build_model/grid/inline_start", definition.inline_start)
@@ -2020,8 +2231,12 @@ class BuildModelWindow(QtWidgets.QDialog):
         self.settings.setValue("build_model/scatter/dip_path", dip_path)
         self.settings.setValue("build_model/scatter/direction_path", direction_path)
 
-    def save_geomap_history(self, geomap_path: str) -> None:
+    def save_elev_history(self, elev_path: str) -> None:
+        self.settings.setValue("build_model/elev/path", elev_path)
+
+    def save_geomap_history(self, geomap_path: str, elev_path: str) -> None:
         self.settings.setValue("build_model/polygon/geomap_path", geomap_path)
+        self.settings.setValue("build_model/polygon/elev_path", elev_path)
 
     def current_grid_definition(self) -> GridDefinition | None:
         try:
@@ -2042,8 +2257,11 @@ class BuildModelWindow(QtWidgets.QDialog):
     def current_scatter_paths(self) -> tuple[str, str]:
         return self.dip_path_edit.text().strip(), self.direction_path_edit.text().strip()
 
-    def current_geomap_path(self) -> str:
-        return self.geomap_path_edit.text().strip()
+    def current_geomap_inputs(self) -> tuple[str, str]:
+        return self.geomap_path_edit.text().strip(), self.geomap_elev_path_edit.text().strip()
+
+    def current_elev_path(self) -> str:
+        return self.elev_path_edit.text().strip()
 
     def _browse_dip_path(self) -> None:
         start_dir = str(Path(self.dip_path_edit.text().strip()).expanduser().parent) if self.dip_path_edit.text().strip() else ""
@@ -2071,6 +2289,18 @@ class BuildModelWindow(QtWidgets.QDialog):
             self.direction_path_edit.setText(path)
             self.save_scatter_history(self.dip_path_edit.text().strip(), path)
 
+    def _browse_elev_path(self) -> None:
+        start_dir = str(Path(self.elev_path_edit.text().strip()).expanduser().parent) if self.elev_path_edit.text().strip() else ""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Elev File",
+            start_dir,
+            "GMP Files (*.gmp);;Text Files (*.txt *.dat *.csv);;All Files (*)",
+        )
+        if path:
+            self.elev_path_edit.setText(path)
+            self.save_elev_history(path)
+
     def _browse_geomap_path(self) -> None:
         start_dir = str(Path(self.geomap_path_edit.text().strip()).expanduser().parent) if self.geomap_path_edit.text().strip() else ""
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -2081,7 +2311,25 @@ class BuildModelWindow(QtWidgets.QDialog):
         )
         if path:
             self.geomap_path_edit.setText(path)
-            self.save_geomap_history(path)
+            self.save_geomap_history(path, self.geomap_elev_path_edit.text().strip())
+
+    def _browse_geomap_elev_path(self) -> None:
+        start_dir = (
+            str(Path(self.geomap_elev_path_edit.text().strip()).expanduser().parent)
+            if self.geomap_elev_path_edit.text().strip()
+            else ""
+        )
+        if not start_dir and self.geomap_path_edit.text().strip():
+            start_dir = str(Path(self.geomap_path_edit.text().strip()).expanduser().parent)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Geomap Elev File",
+            start_dir,
+            "GMP Files (*.gmp);;Text Files (*.txt *.dat *.csv);;All Files (*)",
+        )
+        if path:
+            self.geomap_elev_path_edit.setText(path)
+            self.save_geomap_history(self.geomap_path_edit.text().strip(), path)
 
 
 class DefineGridDialog(QtWidgets.QDialog):
@@ -2549,6 +2797,8 @@ class SliceUpdater:
             polygon.actor.GetProperty().SetLineWidth(3.2 if is_current else 2.0)
             polygon.actor.GetProperty().SetOpacity((1.0 if is_current else 0.90) if polygon.visible else 0.0)
             polygon.actor.SetVisibility(polygon.visible)
+            polygon.point_actor.GetProperty().SetPointSize(13.0 if is_current else 10.0)
+            polygon.point_actor.SetVisibility(bool(polygon.visible and is_current))
         self.refresh_scalar_bar()
         if render:
             self.interactor.GetRenderWindow().Render()
@@ -2869,11 +3119,17 @@ class SliceUpdater:
         *,
         inlines: np.ndarray,
         crosslines: np.ndarray,
+        z_values: np.ndarray | None,
         values: np.ndarray,
         source_path: Path,
         select: bool = False,
     ) -> str:
-        actor, polydata, mapper, lut, value_range = create_scatter_actor(inlines, crosslines, values)
+        actor, polydata, mapper, lut, value_range = create_scatter_actor(
+            inlines,
+            crosslines,
+            values,
+            z_values=z_values,
+        )
         new_name = self._unique_name(self.scatter_sets, name)
         dataset = ScatterDataSet(
             name=new_name,
@@ -2884,6 +3140,11 @@ class SliceUpdater:
             value_range=value_range,
             inlines=np.asarray(inlines, dtype=np.float32).ravel(),
             crosslines=np.asarray(crosslines, dtype=np.float32).ravel(),
+            z_values=(
+                np.zeros_like(np.asarray(values, dtype=np.float32).ravel(), dtype=np.float32)
+                if z_values is None
+                else np.asarray(z_values, dtype=np.float32).ravel()
+            ),
             values=np.asarray(values, dtype=np.float32).ravel(),
             source_path=Path(source_path),
             visible=True,
@@ -2898,24 +3159,40 @@ class SliceUpdater:
         name: str,
         *,
         color_rgb: tuple[int, int, int],
-        rw_points: np.ndarray,
+        grid_points: np.ndarray,
+        z_values: np.ndarray | None,
         source_path: Path,
         select: bool = False,
     ) -> str:
-        actor, polydata, mapper = create_polygon_actor(color_rgb, rw_points)
+        normalized_grid_points = normalize_polygon_grid_points(grid_points)
+        actor, polydata, mapper, point_actor, point_polydata, point_mapper = create_polygon_actors(
+            color_rgb,
+            normalized_grid_points,
+            z_values=z_values,
+        )
+        normalized_z_values = (
+            np.zeros(normalized_grid_points.shape[0], dtype=np.float32)
+            if z_values is None
+            else np.asarray(z_values, dtype=np.float32).ravel()
+        )
         new_name = self._unique_name(self.polygon_sets, name)
         dataset = PolygonDataSet(
             name=new_name,
             actor=actor,
             polydata=polydata,
             mapper=mapper,
+            point_actor=point_actor,
+            point_polydata=point_polydata,
+            point_mapper=point_mapper,
             color_rgb=tuple(int(v) for v in color_rgb),
-            rw_points=np.asarray(rw_points, dtype=np.float32),
+            grid_points=np.asarray(normalized_grid_points, dtype=np.float32),
+            z_values=np.asarray(normalized_z_values, dtype=np.float32),
             source_path=Path(source_path),
             visible=True,
         )
         self.polygon_sets[new_name] = dataset
         self.renderer.AddActor(actor)
+        self.renderer.AddActor(point_actor)
         self.set_current_polygon(new_name if select else self.current_polygon_name, render=False)
         return new_name
 
@@ -3125,6 +3402,7 @@ class SliceUpdater:
         if polygon is None:
             return False
         self.renderer.RemoveActor(polygon.actor)
+        self.renderer.RemoveActor(polygon.point_actor)
         if self.current_polygon_name == name:
             self.set_current_polygon(next(iter(self.polygon_sets), None), render=False)
         return True
@@ -3714,6 +3992,11 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                 ):
                     self.schedule_render()
                     return True
+                if self.pick_polygon(
+                    int(event.position().x()),
+                    int(event.position().y()),
+                ):
+                    return True
             if (
                 event.type() == QtCore.QEvent.Type.Wheel
                 and isinstance(event, QtGui.QWheelEvent)
@@ -3916,7 +4199,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                 DataPanelItem(
                     category="polygon",
                     name=name,
-                    label=f"{name} ({len(self.updater.polygon_sets[name].rw_points)} pts)",
+                    label=f"{name} ({len(self.updater.polygon_sets[name].grid_points)} pts)",
                 )
                 for name in self.updater.polygon_names()
             ],
@@ -4014,6 +4297,21 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self._refresh_selected_master_actor()
         self.refresh_display_controls()
         return True
+
+    def pick_polygon(self, display_x: int, display_y: int) -> bool:
+        if not self.updater.polygon_sets:
+            return False
+        vtk_display_x, vtk_display_y = self._qt_to_vtk_display(display_x, display_y)
+        if self._prop_picker.Pick(float(vtk_display_x), float(vtk_display_y), 0.0, self.renderer) == 0:
+            return False
+        picked_actor = self._prop_picker.GetActor()
+        for name, polygon in self.updater.polygon_sets.items():
+            if not polygon.visible:
+                continue
+            if picked_actor in {polygon.actor, polygon.point_actor}:
+                self.activate_data_item("polygon", name)
+                return True
+        return False
 
     def _refresh_linked_master_points(self) -> None:
         point_set = self.updater.current_control_point_set()
@@ -4185,6 +4483,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self.build_model_window = BuildModelWindow(self)
             self.build_model_window.define_grid_requested.connect(self.open_define_grid_dialog)
             self.build_model_window.load_dip_direction_requested.connect(self.open_load_dip_direction_dialog)
+            self.build_model_window.load_elev_requested.connect(self.open_load_elev_dialog)
             self.build_model_window.load_geomap_requested.connect(self.open_load_geomap_dialog)
         self.build_model_window.show()
         self.build_model_window.raise_()
@@ -4222,6 +4521,45 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             raise ValueError(f"Scatter file must contain three columns: {path.name}")
         return data[:, 0], data[:, 1], data[:, 2]
 
+    def open_load_elev_dialog(self) -> None:
+        if self.build_model_window is None:
+            self.open_build_model_window()
+        if self.build_model_window is None:
+            return
+        elev_path_text = self.build_model_window.current_elev_path()
+        if not elev_path_text:
+            QtWidgets.QMessageBox.information(self, "Missing File", "Please select an elev file.")
+            return
+        grid_definition = self.updater.grid_definition
+        if grid_definition is None:
+            QtWidgets.QMessageBox.information(self, "Missing Grid", "Please define grid before loading elev.")
+            return
+        sample_size = abs(float(grid_definition.sample_size))
+        if sample_size <= 1e-6:
+            QtWidgets.QMessageBox.information(self, "Invalid Grid", "Grid sample size must be greater than zero.")
+            return
+        self.build_model_window.save_elev_history(elev_path_text)
+        elev_path = Path(elev_path_text).expanduser().resolve()
+        try:
+            inlines, crosslines, elev_values = self._read_scatter_gmp(elev_path)
+        except ValueError as exc:
+            QtWidgets.QMessageBox.information(self, "Load Failed", str(exc))
+            return
+        z_values = elev_values / np.float32(sample_size)
+        elev_name = self.updater.add_scatter_data(
+            elev_path.stem,
+            inlines=inlines,
+            crosslines=crosslines,
+            z_values=z_values,
+            values=elev_values,
+            source_path=elev_path,
+            select=True,
+        )
+        self._selected_data_item = ("scatter", elev_name)
+        self.refresh_info()
+        self.refresh_data_panel()
+        self.schedule_render()
+
     def open_load_dip_direction_dialog(self) -> None:
         if self.build_model_window is None:
             self.open_build_model_window()
@@ -4243,6 +4581,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             Path(dip_path_text).stem,
             inlines=dip_inlines,
             crosslines=dip_crosslines,
+            z_values=None,
             values=dip_values,
             source_path=Path(dip_path_text),
             select=True,
@@ -4251,6 +4590,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             Path(direction_path_text).stem,
             inlines=direction_inlines,
             crosslines=direction_crosslines,
+            z_values=None,
             values=direction_values,
             source_path=Path(direction_path_text),
             select=False,
@@ -4264,11 +4604,11 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self.open_build_model_window()
         if self.build_model_window is None:
             return
-        geomap_path_text = self.build_model_window.current_geomap_path()
+        geomap_path_text, geomap_elev_path_text = self.build_model_window.current_geomap_inputs()
         if not geomap_path_text:
             QtWidgets.QMessageBox.information(self, "Missing File", "Please select a geomap file.")
             return
-        self.build_model_window.save_geomap_history(geomap_path_text)
+        self.build_model_window.save_geomap_history(geomap_path_text, geomap_elev_path_text)
         geomap_path = Path(geomap_path_text).expanduser().resolve()
         if not geomap_path.exists():
             QtWidgets.QMessageBox.information(self, "Missing File", f"Geomap file not found:\n{geomap_path}")
@@ -4288,26 +4628,47 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.image = self.updater.scene_image()
         self.refresh_axis_controls()
         self.refresh_scene_guides()
-        filtered_polygons = [
-            (color_rgb, normalize_polygon_rw_points(rw_points))
-            for color_rgb, rw_points in polygons
-            if polygon_intersects_grid(rw_points, grid_definition)
-        ]
-        if not filtered_polygons:
+        elev_surface: ElevSurface | None = None
+        sample_size = abs(float(grid_definition.sample_size))
+        if geomap_elev_path_text:
+            try:
+                elev_inlines, elev_crosslines, elev_values = self._read_scatter_gmp(
+                    Path(geomap_elev_path_text).expanduser().resolve()
+                )
+                elev_surface = build_elev_surface(elev_inlines, elev_crosslines, elev_values)
+            except ValueError as exc:
+                QtWidgets.QMessageBox.information(self, "Load Failed", str(exc))
+                return
+
+        clipped_polygons: list[tuple[tuple[int, int, int], np.ndarray, np.ndarray]] = []
+        for color_rgb, points in polygons:
+            clipped_points = clip_polygon_to_grid(points, grid_definition)
+            clipped_points = normalize_polygon_grid_points(clipped_points)
+            if clipped_points.shape[0] < 3:
+                continue
+            z_values = np.zeros(clipped_points.shape[0], dtype=np.float32)
+            if elev_surface is not None:
+                for index, point in enumerate(clipped_points):
+                    elev_value = elev_surface.sample(float(point[0]), float(point[1]))
+                    z_values[index] = float(elev_value / max(sample_size, 1e-6))
+            clipped_polygons.append((color_rgb, clipped_points, z_values))
+
+        if not clipped_polygons:
             QtWidgets.QMessageBox.information(
                 self,
                 "Load Failed",
-                "No polygons have any point inside the current grid range.",
+                "No polygons remain after clipping to the current grid range.",
             )
             self.refresh_data_panel()
             self.schedule_render()
             return
         first_polygon_name: str | None = None
-        for index, (color_rgb, rw_points) in enumerate(filtered_polygons, start=1):
+        for index, (color_rgb, points, z_values) in enumerate(clipped_polygons, start=1):
             polygon_name = self.updater.add_polygon_data(
                 f"{geomap_path.stem}_{index}",
                 color_rgb=color_rgb,
-                rw_points=rw_points,
+                grid_points=points,
+                z_values=z_values,
                 source_path=geomap_path,
                 select=first_polygon_name is None,
             )
@@ -4728,6 +5089,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                     name=np.array(scatter.name),
                     inlines=np.asarray(scatter.inlines, dtype=np.float32),
                     crosslines=np.asarray(scatter.crosslines, dtype=np.float32),
+                    z_values=np.asarray(scatter.z_values, dtype=np.float32),
                     values=np.asarray(scatter.values, dtype=np.float32),
                     source_path=np.array(str(scatter.source_path)),
                 )
@@ -4743,7 +5105,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             )
             if path:
                 lines = ["Area", f"##{polygon.color_rgb[0]} {polygon.color_rgb[1]} {polygon.color_rgb[2]}"]
-                for point in np.asarray(polygon.rw_points, dtype=np.float32):
+                for point in np.asarray(polygon.grid_points, dtype=np.float32):
                     lines.append(f"{float(point[0]):.3f} {float(point[1]):.3f}")
                 Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
             return
