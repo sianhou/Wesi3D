@@ -172,6 +172,18 @@ class PolygonDataSet:
 
 
 @dataclass
+class ModelSurfaceDataSet:
+    name: str
+    actor: vtk.vtkActor
+    polydata: vtk.vtkPolyData
+    mapper: vtk.vtkPolyDataMapper
+    source_polygon_name: str
+    dip_source_path: Path
+    direction_source_path: Path
+    visible: bool = True
+
+
+@dataclass
 class GridDefinition:
     inline_start: float
     inline_end: float
@@ -724,6 +736,386 @@ def build_elev_surface(inlines: np.ndarray, crosslines: np.ndarray, values: np.n
         raise ValueError("Elev file crossline axis is not a regular grid.")
     value_grid = value_array[order].reshape(inline_axis.size, crossline_axis.size)
     return ElevSurface(inline_axis, crossline_axis, value_grid)
+
+
+def resample_closed_curve(
+    grid_points: np.ndarray,
+    z_values: np.ndarray,
+    sample_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    points = normalize_polygon_grid_points(grid_points)
+    point_z = np.asarray(z_values, dtype=np.float32).ravel()
+    if points.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+    if point_z.size != points.shape[0]:
+        point_z = np.zeros(points.shape[0], dtype=np.float32)
+    if points.shape[0] == 1:
+        return np.repeat(points, sample_count, axis=0), np.repeat(point_z, sample_count, axis=0)
+
+    closed_points = np.vstack([points, points[0]])
+    closed_z = np.append(point_z, point_z[0])
+    segment_lengths = np.linalg.norm(np.diff(closed_points, axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+    total_length = float(cumulative[-1])
+    if total_length <= 1e-6:
+        return np.repeat(points[:1], sample_count, axis=0), np.repeat(point_z[:1], sample_count, axis=0)
+
+    targets = np.linspace(0.0, total_length, int(max(3, sample_count)) + 1, dtype=np.float32)[:-1]
+    sample_points = np.zeros((targets.size, 2), dtype=np.float32)
+    sample_z = np.zeros(targets.size, dtype=np.float32)
+    for index, target in enumerate(targets):
+        segment_index = int(np.searchsorted(cumulative, float(target), side="right") - 1)
+        segment_index = max(0, min(segment_index, segment_lengths.size - 1))
+        start_distance = float(cumulative[segment_index])
+        length = float(segment_lengths[segment_index])
+        weight = 0.0 if length <= 1e-6 else (float(target) - start_distance) / length
+        sample_points[index] = (
+            (1.0 - weight) * closed_points[segment_index] + weight * closed_points[segment_index + 1]
+        )
+        sample_z[index] = float((1.0 - weight) * closed_z[segment_index] + weight * closed_z[segment_index + 1])
+    return sample_points, sample_z
+
+
+def smooth_closed_curve(points_xyz: np.ndarray, iterations: int) -> np.ndarray:
+    smoothed = np.asarray(points_xyz, dtype=np.float32)
+    for _ in range(max(0, int(iterations))):
+        previous_points = np.roll(smoothed, 1, axis=0)
+        next_points = np.roll(smoothed, -1, axis=0)
+        smoothed = 0.25 * previous_points + 0.5 * smoothed + 0.25 * next_points
+    return np.asarray(smoothed, dtype=np.float32)
+
+
+def smooth_closed_scalar(values: np.ndarray, iterations: int) -> np.ndarray:
+    smoothed = np.asarray(values, dtype=np.float32).ravel()
+    for _ in range(max(0, int(iterations))):
+        previous_values = np.roll(smoothed, 1)
+        next_values = np.roll(smoothed, -1)
+        smoothed = 0.25 * previous_values + 0.5 * smoothed + 0.25 * next_values
+    return np.asarray(smoothed, dtype=np.float32)
+
+
+def smooth_closed_angles_deg(values_deg: np.ndarray, iterations: int) -> np.ndarray:
+    angles_rad = np.deg2rad(np.asarray(values_deg, dtype=np.float32).ravel())
+    sin_values = smooth_closed_scalar(np.sin(angles_rad).astype(np.float32, copy=False), iterations)
+    cos_values = smooth_closed_scalar(np.cos(angles_rad).astype(np.float32, copy=False), iterations)
+    return np.asarray((np.rad2deg(np.arctan2(sin_values, cos_values)) + 360.0) % 360.0, dtype=np.float32)
+
+
+def resample_closed_xyz_curve(points_xyz: np.ndarray, sample_count: int) -> np.ndarray:
+    points = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+    if points.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    if points.shape[0] >= 2 and np.allclose(points[0], points[-1]):
+        points = np.asarray(points[:-1], dtype=np.float32)
+    if points.shape[0] == 1:
+        return np.repeat(points, max(3, int(sample_count)), axis=0)
+
+    closed_points = np.vstack([points, points[0]])
+    segment_lengths = np.linalg.norm(np.diff(closed_points, axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+    total_length = float(cumulative[-1])
+    if total_length <= 1e-6:
+        return np.repeat(points[:1], max(3, int(sample_count)), axis=0)
+
+    targets = np.linspace(0.0, total_length, int(max(3, sample_count)) + 1, dtype=np.float32)[:-1]
+    resampled = np.zeros((targets.size, 3), dtype=np.float32)
+    for index, target in enumerate(targets):
+        segment_index = int(np.searchsorted(cumulative, float(target), side="right") - 1)
+        segment_index = max(0, min(segment_index, segment_lengths.size - 1))
+        start_distance = float(cumulative[segment_index])
+        length = float(segment_lengths[segment_index])
+        weight = 0.0 if length <= 1e-6 else (float(target) - start_distance) / length
+        resampled[index] = (
+            (1.0 - weight) * closed_points[segment_index] + weight * closed_points[segment_index + 1]
+        )
+    return np.asarray(resampled, dtype=np.float32)
+
+
+def _segment_intersection_2d(
+    point_a: np.ndarray,
+    point_b: np.ndarray,
+    point_c: np.ndarray,
+    point_d: np.ndarray,
+) -> tuple[np.ndarray, float, float] | None:
+    ax, ay = float(point_a[0]), float(point_a[1])
+    bx, by = float(point_b[0]), float(point_b[1])
+    cx, cy = float(point_c[0]), float(point_c[1])
+    dx, dy = float(point_d[0]), float(point_d[1])
+
+    abx, aby = bx - ax, by - ay
+    cdx, cdy = dx - cx, dy - cy
+    denominator = abx * cdy - aby * cdx
+    if abs(denominator) <= 1e-8:
+        return None
+
+    acx, acy = cx - ax, cy - ay
+    t = (acx * cdy - acy * cdx) / denominator
+    u = (acx * aby - acy * abx) / denominator
+    if not (1e-5 < t < 1.0 - 1e-5 and 1e-5 < u < 1.0 - 1e-5):
+        return None
+    intersection = np.asarray([ax + t * abx, ay + t * aby], dtype=np.float32)
+    return intersection, float(t), float(u)
+
+
+def _closed_loop_length(points_xyz: np.ndarray) -> float:
+    points = np.asarray(points_xyz, dtype=np.float32)
+    if points.shape[0] < 2:
+        return 0.0
+    closed_points = np.vstack([points, points[0]])
+    return float(np.sum(np.linalg.norm(np.diff(closed_points, axis=0), axis=1)))
+
+
+def find_self_intersection_loop(points_xyz: np.ndarray) -> np.ndarray | None:
+    points = np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3)
+    point_total = points.shape[0]
+    if point_total < 4:
+        return None
+
+    for start_index in range(point_total):
+        next_start = (start_index + 1) % point_total
+        seg_a0 = points[start_index, :2]
+        seg_a1 = points[next_start, :2]
+        for end_index in range(start_index + 2, point_total):
+            next_end = (end_index + 1) % point_total
+            if start_index == 0 and next_end == 0:
+                continue
+            seg_b0 = points[end_index, :2]
+            seg_b1 = points[next_end, :2]
+            hit = _segment_intersection_2d(seg_a0, seg_a1, seg_b0, seg_b1)
+            if hit is None:
+                continue
+            intersection_xy, t_ab, t_cd = hit
+            intersection_z_ab = float(points[start_index, 2] + t_ab * (points[next_start, 2] - points[start_index, 2]))
+            intersection_z_cd = float(points[end_index, 2] + t_cd * (points[next_end, 2] - points[end_index, 2]))
+            intersection_xyz = np.asarray(
+                [float(intersection_xy[0]), float(intersection_xy[1]), 0.5 * (intersection_z_ab + intersection_z_cd)],
+                dtype=np.float32,
+            )
+
+            candidate_a = np.vstack([intersection_xyz, points[next_start : end_index + 1], intersection_xyz])
+            candidate_b = np.vstack([intersection_xyz, points[next_end:], points[: start_index + 1], intersection_xyz])
+            valid_candidates = [candidate for candidate in (candidate_a, candidate_b) if candidate.shape[0] >= 4]
+            if not valid_candidates:
+                return None
+            selected = min(valid_candidates, key=_closed_loop_length)
+            return np.asarray(selected[:-1], dtype=np.float32)
+    return None
+
+
+def idw_interpolate_scatter(
+    source_inlines: np.ndarray,
+    source_crosslines: np.ndarray,
+    source_values: np.ndarray,
+    target_points: np.ndarray,
+    *,
+    power: float = 2.0,
+    k_neighbors: int = 8,
+) -> np.ndarray:
+    inlines = np.asarray(source_inlines, dtype=np.float32).ravel()
+    crosslines = np.asarray(source_crosslines, dtype=np.float32).ravel()
+    values = np.asarray(source_values, dtype=np.float32).ravel()
+    targets = np.asarray(target_points, dtype=np.float32).reshape(-1, 2)
+    if not (inlines.size == crosslines.size == values.size):
+        raise ValueError("Scatter interpolation inputs must have the same length.")
+    if inlines.size == 0:
+        raise ValueError("Scatter interpolation source is empty.")
+
+    deltas_inline = targets[:, None, 0] - inlines[None, :]
+    deltas_crossline = targets[:, None, 1] - crosslines[None, :]
+    distances2 = deltas_inline * deltas_inline + deltas_crossline * deltas_crossline
+    neighbor_count = max(1, min(int(k_neighbors), values.size))
+    neighbor_indices = np.argpartition(distances2, neighbor_count - 1, axis=1)[:, :neighbor_count]
+    neighbor_distances2 = np.take_along_axis(distances2, neighbor_indices, axis=1)
+    neighbor_values = values[neighbor_indices]
+
+    exact_mask = neighbor_distances2 <= 1e-12
+    weights = 1.0 / np.maximum(neighbor_distances2, 1e-12) ** (float(power) * 0.5)
+    weights[exact_mask] = 0.0
+    weight_sum = np.sum(weights, axis=1)
+    interpolated = np.sum(weights * neighbor_values, axis=1) / np.maximum(weight_sum, 1e-12)
+    if np.any(exact_mask):
+        exact_rows = np.any(exact_mask, axis=1)
+        exact_cols = np.argmax(exact_mask[exact_rows], axis=1)
+        interpolated[exact_rows] = neighbor_values[exact_rows, exact_cols]
+    return np.asarray(interpolated, dtype=np.float32)
+
+
+def interpolate_direction_scatter(
+    source_inlines: np.ndarray,
+    source_crosslines: np.ndarray,
+    source_directions_deg: np.ndarray,
+    target_points: np.ndarray,
+) -> np.ndarray:
+    directions_rad = np.deg2rad(np.asarray(source_directions_deg, dtype=np.float32).ravel())
+    sin_values = np.sin(directions_rad).astype(np.float32, copy=False)
+    cos_values = np.cos(directions_rad).astype(np.float32, copy=False)
+    interp_sin = idw_interpolate_scatter(source_inlines, source_crosslines, sin_values, target_points)
+    interp_cos = idw_interpolate_scatter(source_inlines, source_crosslines, cos_values, target_points)
+    return np.asarray((np.rad2deg(np.arctan2(interp_sin, interp_cos)) + 360.0) % 360.0, dtype=np.float32)
+
+
+def build_extruded_polygon_surface(
+    polygon_points: np.ndarray,
+    polygon_z_values: np.ndarray,
+    dip_inlines: np.ndarray,
+    dip_crosslines: np.ndarray,
+    dip_values: np.ndarray,
+    direction_inlines: np.ndarray,
+    direction_crosslines: np.ndarray,
+    direction_values: np.ndarray,
+    *,
+    sample_count: int,
+    layer_step: float,
+    target_depth: float,
+    smooth_iterations: int,
+) -> vtk.vtkPolyData:
+    boundary_points, boundary_z = resample_closed_curve(polygon_points, polygon_z_values, sample_count)
+    if boundary_points.shape[0] < 3:
+        raise ValueError("Polygon must contain at least 3 points.")
+
+    point_total = boundary_points.shape[0]
+    current_layer = np.zeros((point_total, 3), dtype=np.float32)
+    current_layer[:, 0] = boundary_points[:, 1]
+    current_layer[:, 1] = boundary_points[:, 0]
+    current_layer[:, 2] = boundary_z
+
+    surface_layers = [np.asarray(current_layer, dtype=np.float32)]
+    closed_surface = False
+    target_depth_value = float(target_depth)
+    vertical_step = max(1e-3, float(layer_step))
+    stabilization_iterations = max(1, int(smooth_iterations) + 1)
+
+    max_iterations = max(1, int(np.ceil(max(target_depth_value - float(np.min(boundary_z)), 0.0) / vertical_step)) + 2)
+    for _ in range(max_iterations):
+        remaining_depth = np.maximum(target_depth_value - current_layer[:, 2], 0.0).astype(np.float32, copy=False)
+        if not np.any(remaining_depth > 1e-4):
+            break
+
+        current_boundary_points = np.column_stack([current_layer[:, 1], current_layer[:, 0]]).astype(np.float32, copy=False)
+        dips_deg = np.clip(
+            idw_interpolate_scatter(dip_inlines, dip_crosslines, dip_values, current_boundary_points),
+            1.0,
+            89.0,
+        )
+        directions_deg = interpolate_direction_scatter(
+            direction_inlines,
+            direction_crosslines,
+            direction_values,
+            current_boundary_points,
+        )
+        dips_deg = np.clip(smooth_closed_scalar(dips_deg, stabilization_iterations), 1.0, 89.0)
+        directions_deg = smooth_closed_angles_deg(directions_deg, stabilization_iterations)
+
+        directions_rad = np.deg2rad(directions_deg)
+        dips_rad = np.deg2rad(dips_deg)
+        vertical_step_vector = np.minimum(np.full(point_total, vertical_step, dtype=np.float32), remaining_depth)
+        horizontal_step = vertical_step_vector / np.maximum(np.tan(dips_rad), 1e-3)
+
+        boundary_loop = np.vstack([current_boundary_points, current_boundary_points[0]])
+        edge_lengths = np.linalg.norm(np.diff(boundary_loop, axis=0), axis=1)
+        local_spacing = np.minimum(edge_lengths, np.roll(edge_lengths, 1))
+        max_horizontal_step = np.maximum(0.35 * local_spacing, vertical_step_vector * 0.5)
+        horizontal_step = np.minimum(horizontal_step, max_horizontal_step.astype(np.float32, copy=False))
+
+        next_layer = np.array(current_layer, copy=True)
+        next_layer[:, 0] = next_layer[:, 0] + horizontal_step * np.sin(directions_rad)
+        next_layer[:, 1] = next_layer[:, 1] + horizontal_step * np.cos(directions_rad)
+        next_layer[:, 2] = np.minimum(next_layer[:, 2] + vertical_step_vector, target_depth_value)
+        next_layer = smooth_closed_curve(next_layer, smooth_iterations)
+        next_layer[:, 2] = np.minimum(next_layer[:, 2], target_depth_value)
+
+        intersection_loop = find_self_intersection_loop(next_layer)
+        if intersection_loop is not None and intersection_loop.shape[0] >= 3:
+            next_layer = resample_closed_xyz_curve(intersection_loop, point_total)
+            closed_surface = True
+            surface_layers.append(np.asarray(next_layer, dtype=np.float32))
+            break
+
+        surface_layers.append(np.asarray(next_layer, dtype=np.float32))
+        current_layer = next_layer
+
+    surface_points = np.stack(surface_layers, axis=0)
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetData(numpy_support.numpy_to_vtk(surface_points.reshape(-1, 3), deep=True))
+
+    polys = vtk.vtkCellArray()
+    for layer_index in range(surface_points.shape[0] - 1):
+        row_offset = layer_index * point_total
+        next_row_offset = (layer_index + 1) * point_total
+        for point_index in range(point_total):
+            next_point_index = (point_index + 1) % point_total
+            tri_a = vtk.vtkTriangle()
+            tri_a.GetPointIds().SetId(0, row_offset + point_index)
+            tri_a.GetPointIds().SetId(1, row_offset + next_point_index)
+            tri_a.GetPointIds().SetId(2, next_row_offset + point_index)
+            polys.InsertNextCell(tri_a)
+
+            tri_b = vtk.vtkTriangle()
+            tri_b.GetPointIds().SetId(0, next_row_offset + point_index)
+            tri_b.GetPointIds().SetId(1, row_offset + next_point_index)
+            tri_b.GetPointIds().SetId(2, next_row_offset + next_point_index)
+            polys.InsertNextCell(tri_b)
+
+    side_polydata = vtk.vtkPolyData()
+    side_polydata.SetPoints(vtk_points)
+    side_polydata.SetPolys(polys)
+
+    combined_polydata = side_polydata
+    if closed_surface:
+        append = vtk.vtkAppendPolyData()
+        append.AddInputData(side_polydata)
+        for cap_points in (surface_points[0], surface_points[-1][::-1]):
+            cap_points_vtk = vtk.vtkPoints()
+            cap_points_vtk.SetData(numpy_support.numpy_to_vtk(np.asarray(cap_points, dtype=np.float32), deep=True))
+            contour = vtk.vtkPolyData()
+            contour.SetPoints(cap_points_vtk)
+            lines = vtk.vtkCellArray()
+            polyline = vtk.vtkPolyLine()
+            polyline.GetPointIds().SetNumberOfIds(cap_points.shape[0] + 1)
+            for point_index in range(cap_points.shape[0]):
+                polyline.GetPointIds().SetId(point_index, point_index)
+            polyline.GetPointIds().SetId(cap_points.shape[0], 0)
+            lines.InsertNextCell(polyline)
+            contour.SetLines(lines)
+            triangulator = vtk.vtkContourTriangulator()
+            triangulator.SetInputData(contour)
+            triangulator.Update()
+            append.AddInputData(triangulator.GetOutput())
+        append.Update()
+        cleaner = vtk.vtkCleanPolyData()
+        cleaner.SetInputConnection(append.GetOutputPort())
+        cleaner.Update()
+        combined_polydata = vtk.vtkPolyData()
+        combined_polydata.DeepCopy(cleaner.GetOutput())
+
+    normals = vtk.vtkPolyDataNormals()
+    normals.SetInputData(combined_polydata)
+    normals.ConsistencyOn()
+    normals.SplittingOff()
+    normals.AutoOrientNormalsOn()
+    normals.Update()
+
+    output = vtk.vtkPolyData()
+    output.DeepCopy(normals.GetOutput())
+    return output
+
+
+def create_model_surface_actor(
+    polydata: vtk.vtkPolyData,
+    *,
+    color: tuple[float, float, float] = (0.93, 0.72, 0.38),
+) -> tuple[vtk.vtkActor, vtk.vtkPolyDataMapper]:
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputData(polydata)
+    mapper.ScalarVisibilityOff()
+
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetColor(*color)
+    actor.GetProperty().SetOpacity(0.76)
+    actor.GetProperty().SetInterpolationToPhong()
+    actor.GetProperty().EdgeVisibilityOff()
+    return actor, mapper
 
 
 def clip_polygon_to_grid(polygon_points: np.ndarray, grid_definition: GridDefinition) -> np.ndarray:
@@ -2047,6 +2439,7 @@ class BuildModelWindow(QtWidgets.QDialog):
     load_dip_direction_requested = QtCore.Signal()
     load_elev_requested = QtCore.Signal()
     load_geomap_requested = QtCore.Signal()
+    build_polygon_surface_requested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2194,6 +2587,34 @@ class BuildModelWindow(QtWidgets.QDialog):
         geomap_layout.addWidget(self.load_geomap_button)
         layout.addWidget(self.geomap_group, stretch=1)
 
+        self.surface_group = QtWidgets.QGroupBox("Extend Polygon")
+        surface_layout = QtWidgets.QVBoxLayout(self.surface_group)
+        surface_layout.setContentsMargins(8, 6, 8, 6)
+        surface_layout.setSpacing(6)
+        surface_form = QtWidgets.QGridLayout()
+        surface_form.setHorizontalSpacing(6)
+        surface_form.setVerticalSpacing(4)
+        int_validator = QtGui.QIntValidator(1, 10**6, self)
+        self.surface_sample_count_edit = QtWidgets.QLineEdit()
+        self.surface_layer_step_edit = QtWidgets.QLineEdit()
+        self.surface_smooth_iterations_edit = QtWidgets.QLineEdit()
+        self.surface_sample_count_edit.setValidator(int_validator)
+        self.surface_smooth_iterations_edit.setValidator(int_validator)
+        self.surface_layer_step_edit.setValidator(float_validator)
+        surface_form.addWidget(QtWidgets.QLabel("Samples"), 0, 0)
+        surface_form.addWidget(self.surface_sample_count_edit, 0, 1)
+        surface_form.addWidget(QtWidgets.QLabel("Z Step"), 0, 2)
+        surface_form.addWidget(self.surface_layer_step_edit, 0, 3)
+        surface_form.addWidget(QtWidgets.QLabel("Smooth"), 1, 0)
+        surface_form.addWidget(self.surface_smooth_iterations_edit, 1, 1)
+        surface_form.addWidget(QtWidgets.QLabel("Depth"), 1, 2)
+        surface_form.addWidget(QtWidgets.QLabel("Grid Bottom"), 1, 3)
+        surface_layout.addLayout(surface_form)
+        self.build_polygon_surface_button = QtWidgets.QPushButton("Build Surface")
+        self.build_polygon_surface_button.clicked.connect(self.build_polygon_surface_requested.emit)
+        surface_layout.addWidget(self.build_polygon_surface_button)
+        layout.addWidget(self.surface_group)
+
         self.close_button = QtWidgets.QPushButton("Close")
         self.close_button.clicked.connect(self.hide)
         layout.addWidget(self.close_button)
@@ -2215,6 +2636,9 @@ class BuildModelWindow(QtWidgets.QDialog):
         self.elev_path_edit.setText(str(self.settings.value("build_model/elev/path", "")))
         self.geomap_path_edit.setText(str(self.settings.value("build_model/polygon/geomap_path", "")))
         self.geomap_elev_path_edit.setText(str(self.settings.value("build_model/polygon/elev_path", "")))
+        self.surface_sample_count_edit.setText(str(self.settings.value("build_model/surface/sample_count", "160")))
+        self.surface_layer_step_edit.setText(str(self.settings.value("build_model/surface/layer_step", "4")))
+        self.surface_smooth_iterations_edit.setText(str(self.settings.value("build_model/surface/smooth_iterations", "2")))
 
     def save_grid_history(self, definition: GridDefinition) -> None:
         self.settings.setValue("build_model/grid/inline_start", definition.inline_start)
@@ -2237,6 +2661,17 @@ class BuildModelWindow(QtWidgets.QDialog):
     def save_geomap_history(self, geomap_path: str, elev_path: str) -> None:
         self.settings.setValue("build_model/polygon/geomap_path", geomap_path)
         self.settings.setValue("build_model/polygon/elev_path", elev_path)
+
+    def save_surface_history(
+        self,
+        *,
+        sample_count: int,
+        layer_step: float,
+        smooth_iterations: int,
+    ) -> None:
+        self.settings.setValue("build_model/surface/sample_count", int(sample_count))
+        self.settings.setValue("build_model/surface/layer_step", float(layer_step))
+        self.settings.setValue("build_model/surface/smooth_iterations", int(smooth_iterations))
 
     def current_grid_definition(self) -> GridDefinition | None:
         try:
@@ -2262,6 +2697,16 @@ class BuildModelWindow(QtWidgets.QDialog):
 
     def current_elev_path(self) -> str:
         return self.elev_path_edit.text().strip()
+
+    def current_surface_options(self) -> dict[str, float] | None:
+        try:
+            return {
+                "sample_count": max(16, int(self.surface_sample_count_edit.text().strip() or "160")),
+                "layer_step": max(1e-3, abs(float(self.surface_layer_step_edit.text().strip() or "4"))),
+                "smooth_iterations": max(0, int(self.surface_smooth_iterations_edit.text().strip() or "2")),
+            }
+        except ValueError:
+            return None
 
     def _browse_dip_path(self) -> None:
         start_dir = str(Path(self.dip_path_edit.text().strip()).expanduser().parent) if self.dip_path_edit.text().strip() else ""
@@ -2429,6 +2874,7 @@ class SliceUpdater:
         self.horizons: dict[str, HorizonSurface] = {}
         self.scatter_sets: dict[str, ScatterDataSet] = {}
         self.polygon_sets: dict[str, PolygonDataSet] = {}
+        self.model_surfaces: dict[str, ModelSurfaceDataSet] = {}
         self.grid_definition: GridDefinition | None = None
         self.grid_image: vtk.vtkImageData | None = None
         self.grid_actor: vtk.vtkActor | None = None
@@ -2436,6 +2882,7 @@ class SliceUpdater:
         self.current_attribute_name: str | None = None
         self.current_scatter_name: str | None = None
         self.current_polygon_name: str | None = None
+        self.current_model_name: str | None = None
         self.last_rebuild_error: str | None = None
         self.image = bundles["xline"].image
         self.xlines = np.asarray([0.0], dtype=np.float32)
@@ -2542,6 +2989,9 @@ class SliceUpdater:
     def polygon_names(self) -> list[str]:
         return list(self.polygon_sets.keys())
 
+    def model_names(self) -> list[str]:
+        return list(self.model_surfaces.keys())
+
     def current_attribute_opacity(self) -> float:
         attribute = self.current_attribute()
         if attribute is None:
@@ -2571,6 +3021,11 @@ class SliceUpdater:
             return None
         return self.polygon_sets.get(self.current_polygon_name)
 
+    def current_model_surface(self) -> ModelSurfaceDataSet | None:
+        if self.current_model_name is None:
+            return None
+        return self.model_surfaces.get(self.current_model_name)
+
     def set_index(self, orientation: str, index: int, render: bool = True) -> None:
         if not self.has_attribute_data():
             return
@@ -2591,6 +3046,7 @@ class SliceUpdater:
             raise KeyError(f"Unknown attribute: {name}")
         self.set_current_scatter(None, render=False)
         self.set_current_polygon(None, render=False)
+        self.set_current_model_surface(None, render=False)
         attr = self.attributes[name]
         self.current_attribute_name = name
         self.image = attr.image
@@ -2799,6 +3255,18 @@ class SliceUpdater:
             polygon.actor.SetVisibility(polygon.visible)
             polygon.point_actor.GetProperty().SetPointSize(13.0 if is_current else 10.0)
             polygon.point_actor.SetVisibility(bool(polygon.visible and is_current))
+        self.refresh_scalar_bar()
+        if render:
+            self.interactor.GetRenderWindow().Render()
+
+    def set_current_model_surface(self, name: str | None, render: bool = True) -> None:
+        self.current_model_name = name if name in self.model_surfaces else None
+        for model_name, model_surface in self.model_surfaces.items():
+            is_current = model_name == self.current_model_name
+            model_surface.actor.GetProperty().SetOpacity((0.92 if is_current else 0.76) if model_surface.visible else 0.0)
+            model_surface.actor.GetProperty().SetEdgeVisibility(is_current)
+            model_surface.actor.GetProperty().SetLineWidth(1.6 if is_current else 1.0)
+            model_surface.actor.SetVisibility(model_surface.visible)
         self.refresh_scalar_bar()
         if render:
             self.interactor.GetRenderWindow().Render()
@@ -3196,6 +3664,33 @@ class SliceUpdater:
         self.set_current_polygon(new_name if select else self.current_polygon_name, render=False)
         return new_name
 
+    def add_model_surface(
+        self,
+        name: str,
+        *,
+        polydata: vtk.vtkPolyData,
+        source_polygon_name: str,
+        dip_source_path: Path,
+        direction_source_path: Path,
+        select: bool = False,
+    ) -> str:
+        actor, mapper = create_model_surface_actor(polydata)
+        new_name = self._unique_name(self.model_surfaces, name)
+        dataset = ModelSurfaceDataSet(
+            name=new_name,
+            actor=actor,
+            polydata=polydata,
+            mapper=mapper,
+            source_polygon_name=source_polygon_name,
+            dip_source_path=Path(dip_source_path),
+            direction_source_path=Path(direction_source_path),
+            visible=True,
+        )
+        self.model_surfaces[new_name] = dataset
+        self.renderer.AddActor(actor)
+        self.set_current_model_surface(new_name if select else self.current_model_name, render=False)
+        return new_name
+
     def set_grid_definition(self, definition: GridDefinition, render: bool = True) -> None:
         self.grid_definition = definition
         self.spacing = RenderSpacing(
@@ -3405,6 +3900,15 @@ class SliceUpdater:
         self.renderer.RemoveActor(polygon.point_actor)
         if self.current_polygon_name == name:
             self.set_current_polygon(next(iter(self.polygon_sets), None), render=False)
+        return True
+
+    def remove_model_surface(self, name: str) -> bool:
+        model_surface = self.model_surfaces.pop(name, None)
+        if model_surface is None:
+            return False
+        self.renderer.RemoveActor(model_surface.actor)
+        if self.current_model_name == name:
+            self.set_current_model_surface(next(iter(self.model_surfaces), None), render=False)
         return True
 
     def current_control_point_display_scale(self) -> float | None:
@@ -3709,8 +4213,9 @@ class SliceUpdater:
         title = ""
         scatter = self.current_scatter()
         polygon = self.current_polygon()
+        model_surface = self.current_model_surface()
         point_set = self.current_control_point_set()
-        if polygon is not None:
+        if polygon is not None or model_surface is not None:
             lut = None
         elif scatter is not None:
             lut = scatter.lut
@@ -4203,6 +4708,14 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                 )
                 for name in self.updater.polygon_names()
             ],
+            "model": [
+                DataPanelItem(
+                    category="model",
+                    name=name,
+                    label=f"{name} ({self.updater.model_surfaces[name].polydata.GetNumberOfPolys()} tris)",
+                )
+                for name in self.updater.model_names()
+            ],
             "well": [],
         }
         self.data_panel.set_items(items)
@@ -4222,15 +4735,22 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         elif category == "horizon":
             self.attribute_colormap_widget.set_target("control_point")
             self.updater.set_current_horizon(name, render=False)
+            self.updater.set_current_model_surface(None, render=False)
             self._selected_master_point_index = None
             self._linked_master_point_indices.clear()
             self._refresh_selected_master_actor()
         elif category == "scatter":
             self.updater.set_current_scatter(name, render=False)
             self.updater.set_current_polygon(None, render=False)
+            self.updater.set_current_model_surface(None, render=False)
         elif category == "polygon":
             self.updater.set_current_scatter(None, render=False)
             self.updater.set_current_polygon(name, render=False)
+            self.updater.set_current_model_surface(None, render=False)
+        elif category == "model":
+            self.updater.set_current_scatter(None, render=False)
+            self.updater.set_current_polygon(None, render=False)
+            self.updater.set_current_model_surface(name, render=False)
         self.refresh_info()
         self.refresh_data_panel()
         self.schedule_render()
@@ -4485,6 +5005,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self.build_model_window.load_dip_direction_requested.connect(self.open_load_dip_direction_dialog)
             self.build_model_window.load_elev_requested.connect(self.open_load_elev_dialog)
             self.build_model_window.load_geomap_requested.connect(self.open_load_geomap_dialog)
+            self.build_model_window.build_polygon_surface_requested.connect(self.open_build_polygon_surface_dialog)
         self.build_model_window.show()
         self.build_model_window.raise_()
         self.build_model_window.activateWindow()
@@ -4520,6 +5041,68 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         if data.ndim != 2 or data.shape[1] < 3:
             raise ValueError(f"Scatter file must contain three columns: {path.name}")
         return data[:, 0], data[:, 1], data[:, 2]
+
+    def open_build_polygon_surface_dialog(self) -> None:
+        if self.build_model_window is None:
+            self.open_build_model_window()
+        if self.build_model_window is None:
+            return
+        polygon = self.updater.current_polygon()
+        if polygon is None:
+            QtWidgets.QMessageBox.information(self, "Missing Polygon", "Please select a polygon first.")
+            return
+        options = self.build_model_window.current_surface_options()
+        if options is None:
+            QtWidgets.QMessageBox.information(self, "Invalid Parameters", "Please enter valid surface build parameters.")
+            return
+        dip_path_text, direction_path_text = self.build_model_window.current_scatter_paths()
+        if not dip_path_text or not direction_path_text:
+            QtWidgets.QMessageBox.information(self, "Missing Files", "Please select both dip and direction files.")
+            return
+        self.build_model_window.save_surface_history(
+            sample_count=int(options["sample_count"]),
+            layer_step=float(options["layer_step"]),
+            smooth_iterations=int(options["smooth_iterations"]),
+        )
+        grid_definition = self.updater.grid_definition
+        if grid_definition is None:
+            QtWidgets.QMessageBox.information(self, "Missing Grid", "Please define grid before building surface.")
+            return
+        dip_path = Path(dip_path_text).expanduser().resolve()
+        direction_path = Path(direction_path_text).expanduser().resolve()
+        try:
+            dip_inlines, dip_crosslines, dip_values = self._read_scatter_gmp(dip_path)
+            direction_inlines, direction_crosslines, direction_values = self._read_scatter_gmp(direction_path)
+            polydata = build_extruded_polygon_surface(
+                polygon.grid_points,
+                polygon.z_values,
+                dip_inlines,
+                dip_crosslines,
+                dip_values,
+                direction_inlines,
+                direction_crosslines,
+                direction_values,
+                sample_count=int(options["sample_count"]),
+                layer_step=float(options["layer_step"]),
+                target_depth=max(float(grid_definition.sample_start), float(grid_definition.sample_end)),
+                smooth_iterations=int(options["smooth_iterations"]),
+            )
+        except ValueError as exc:
+            QtWidgets.QMessageBox.information(self, "Build Failed", str(exc))
+            return
+
+        surface_name = self.updater.add_model_surface(
+            f"{polygon.name}_surface",
+            polydata=polydata,
+            source_polygon_name=polygon.name,
+            dip_source_path=dip_path,
+            direction_source_path=direction_path,
+            select=True,
+        )
+        self._selected_data_item = ("model", surface_name)
+        self.refresh_info()
+        self.refresh_data_panel()
+        self.schedule_render()
 
     def open_load_elev_dialog(self) -> None:
         if self.build_model_window is None:
@@ -5110,6 +5693,28 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                 Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
             return
 
+        if category == "model":
+            model_surface = self.updater.model_surfaces[name]
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Store Model Surface",
+                str(self._default_output_dir(category) / f"{name}.npz"),
+                "NumPy Archive (*.npz)",
+            )
+            if path:
+                polydata_payload = polydata_to_payload(model_surface.polydata)
+                np.savez_compressed(
+                    path,
+                    name=np.array(model_surface.name),
+                    source_polygon_name=np.array(model_surface.source_polygon_name),
+                    dip_source_path=np.array(str(model_surface.dip_source_path)),
+                    direction_source_path=np.array(str(model_surface.direction_source_path)),
+                    polydata_points=polydata_payload["points"],
+                    polydata_polys_offsets=polydata_payload["polys_offsets"],
+                    polydata_polys_connectivity=polydata_payload["polys_connectivity"],
+                )
+            return
+
         QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据存储尚未实现。")
 
     def unload_data_item(self, category: str, name: str) -> None:
@@ -5123,6 +5728,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             removed = self.updater.remove_scatter(name)
         elif category == "polygon":
             removed = self.updater.remove_polygon(name)
+        elif category == "model":
+            removed = self.updater.remove_model_surface(name)
         else:
             QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据卸载尚未实现。")
             return
@@ -5139,17 +5746,21 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             if current_polygon is not None:
                 self._selected_data_item = ("polygon", current_polygon.name)
             else:
-                current_attribute = self.updater.current_attribute()
-                if current_attribute is not None and self.updater.current_attribute_name is not None:
-                    fallback_category = str(
-                        current_attribute.volume_data.metadata.get(
-                            "panel_category",
-                            "seismic" if self.updater.current_attribute_name == "seismic" else "attribute",
-                        )
-                    )
-                    self._selected_data_item = (fallback_category, self.updater.current_attribute_name)
+                current_model = self.updater.current_model_surface()
+                if current_model is not None:
+                    self._selected_data_item = ("model", current_model.name)
                 else:
-                    self._selected_data_item = None
+                    current_attribute = self.updater.current_attribute()
+                    if current_attribute is not None and self.updater.current_attribute_name is not None:
+                        fallback_category = str(
+                            current_attribute.volume_data.metadata.get(
+                                "panel_category",
+                                "seismic" if self.updater.current_attribute_name == "seismic" else "attribute",
+                            )
+                        )
+                        self._selected_data_item = (fallback_category, self.updater.current_attribute_name)
+                    else:
+                        self._selected_data_item = None
         self.refresh_axis_controls()
         self.refresh_scene_guides()
         self.refresh_info()
