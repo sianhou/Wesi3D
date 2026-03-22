@@ -1026,7 +1026,9 @@ def build_extruded_polygon_surface(
 
         intersection_loop = find_self_intersection_loop(next_layer)
         if intersection_loop is not None and intersection_loop.shape[0] >= 3:
-            next_layer = resample_closed_xyz_curve(intersection_loop, point_total)
+            closed_loop = resample_closed_xyz_curve(intersection_loop, point_total)
+            closed_loop = smooth_closed_curve(closed_loop, max(2, smooth_iterations + 2))
+            next_layer = resample_closed_xyz_curve(closed_loop, point_total)
             closed_surface = True
             surface_layers.append(np.asarray(next_layer, dtype=np.float32))
             break
@@ -1085,8 +1087,15 @@ def build_extruded_polygon_surface(
         cleaner = vtk.vtkCleanPolyData()
         cleaner.SetInputConnection(append.GetOutputPort())
         cleaner.Update()
+        smoother = vtk.vtkSmoothPolyDataFilter()
+        smoother.SetInputConnection(cleaner.GetOutputPort())
+        smoother.SetNumberOfIterations(max(12, smooth_iterations * 6))
+        smoother.SetRelaxationFactor(0.08)
+        smoother.FeatureEdgeSmoothingOff()
+        smoother.BoundarySmoothingOn()
+        smoother.Update()
         combined_polydata = vtk.vtkPolyData()
-        combined_polydata.DeepCopy(cleaner.GetOutput())
+        combined_polydata.DeepCopy(smoother.GetOutput())
 
     normals = vtk.vtkPolyDataNormals()
     normals.SetInputData(combined_polydata)
@@ -5047,9 +5056,9 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self.open_build_model_window()
         if self.build_model_window is None:
             return
-        polygon = self.updater.current_polygon()
-        if polygon is None:
-            QtWidgets.QMessageBox.information(self, "Missing Polygon", "Please select a polygon first.")
+        polygons = list(self.updater.polygon_sets.values())
+        if not polygons:
+            QtWidgets.QMessageBox.information(self, "Missing Polygon", "Please load polygons first.")
             return
         options = self.build_model_window.current_surface_options()
         if options is None:
@@ -5073,33 +5082,64 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         try:
             dip_inlines, dip_crosslines, dip_values = self._read_scatter_gmp(dip_path)
             direction_inlines, direction_crosslines, direction_values = self._read_scatter_gmp(direction_path)
-            polydata = build_extruded_polygon_surface(
-                polygon.grid_points,
-                polygon.z_values,
-                dip_inlines,
-                dip_crosslines,
-                dip_values,
-                direction_inlines,
-                direction_crosslines,
-                direction_values,
-                sample_count=int(options["sample_count"]),
-                layer_step=float(options["layer_step"]),
-                target_depth=max(float(grid_definition.sample_start), float(grid_definition.sample_end)),
-                smooth_iterations=int(options["smooth_iterations"]),
-            )
         except ValueError as exc:
             QtWidgets.QMessageBox.information(self, "Build Failed", str(exc))
             return
 
-        surface_name = self.updater.add_model_surface(
-            f"{polygon.name}_surface",
-            polydata=polydata,
-            source_polygon_name=polygon.name,
-            dip_source_path=dip_path,
-            direction_source_path=direction_path,
-            select=True,
+        first_surface_name: str | None = None
+        built_count = 0
+        skipped_count = 0
+        total_count = len(polygons)
+        for polygon in polygons:
+            try:
+                polydata = build_extruded_polygon_surface(
+                    polygon.grid_points,
+                    polygon.z_values,
+                    dip_inlines,
+                    dip_crosslines,
+                    dip_values,
+                    direction_inlines,
+                    direction_crosslines,
+                    direction_values,
+                    sample_count=int(options["sample_count"]),
+                    layer_step=float(options["layer_step"]),
+                    target_depth=max(float(grid_definition.sample_start), float(grid_definition.sample_end)),
+                    smooth_iterations=int(options["smooth_iterations"]),
+                )
+            except ValueError:
+                skipped_count += 1
+                print(
+                    f"[Build Surface] skipped polygon {polygon.name} ({built_count}/{total_count} built, {skipped_count} skipped)",
+                    flush=True,
+                )
+                continue
+
+            surface_name = self.updater.add_model_surface(
+                f"{polygon.name}_surface",
+                polydata=polydata,
+                source_polygon_name=polygon.name,
+                dip_source_path=dip_path,
+                direction_source_path=direction_path,
+                select=first_surface_name is None,
+            )
+            built_count += 1
+            print(
+                f"[Build Surface] built {built_count}/{total_count}: {surface_name}",
+                flush=True,
+            )
+            if first_surface_name is None:
+                first_surface_name = surface_name
+
+        if first_surface_name is None:
+            QtWidgets.QMessageBox.information(self, "Build Failed", "No polygon surface could be generated.")
+            return
+
+        print(
+            f"[Build Surface] completed: {built_count} built, {skipped_count} skipped, {total_count} total",
+            flush=True,
         )
-        self._selected_data_item = ("model", surface_name)
+
+        self._selected_data_item = ("model", first_surface_name)
         self.refresh_info()
         self.refresh_data_panel()
         self.schedule_render()
