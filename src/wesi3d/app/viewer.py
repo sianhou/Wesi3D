@@ -139,6 +139,60 @@ class ControlPointSet:
         return None
 
 
+@dataclass
+class ScatterDataSet:
+    name: str
+    actor: vtk.vtkActor
+    polydata: vtk.vtkPolyData
+    mapper: vtk.vtkPolyDataMapper
+    lut: vtk.vtkLookupTable
+    value_range: tuple[float, float]
+    inlines: np.ndarray
+    crosslines: np.ndarray
+    values: np.ndarray
+    source_path: Path
+    visible: bool = True
+
+
+@dataclass
+class GridDefinition:
+    inline_start: float
+    inline_end: float
+    crossline_start: float
+    crossline_end: float
+    sample_start: float
+    sample_end: float
+    inline_size: float
+    crossline_size: float
+    sample_size: float
+
+    @staticmethod
+    def _axis_values(start: float, end: float, step_size: float) -> np.ndarray:
+        start_value = float(start)
+        end_value = float(end)
+        size_value = max(1e-6, abs(float(step_size)))
+        if start_value == end_value:
+            return np.asarray([start_value], dtype=np.float32)
+        step = size_value if end_value >= start_value else -size_value
+        stop = end_value + step
+        values = np.arange(start_value, stop, step, dtype=np.float32)
+        if values.size == 0 or not np.isclose(values[-1], end_value):
+            values = np.append(values, np.float32(end_value))
+        return np.asarray(values, dtype=np.float32)
+
+    @property
+    def inline_values(self) -> np.ndarray:
+        return self._axis_values(self.inline_start, self.inline_end, self.inline_size)
+
+    @property
+    def crossline_values(self) -> np.ndarray:
+        return self._axis_values(self.crossline_start, self.crossline_end, self.crossline_size)
+
+    @property
+    def sample_values(self) -> np.ndarray:
+        return self._axis_values(self.sample_start, self.sample_end, self.sample_size)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SEG-Y slice viewer")
     parser.add_argument("segy_path", nargs="?", default=None, help="Optional path to a SEG-Y file.")
@@ -411,6 +465,142 @@ def create_axis_label_actor(text: str, x: float, y: float, z: float) -> vtk.vtkB
     prop.SetColor(0.92, 0.92, 0.92)
     prop.SetJustificationToCentered()
     prop.SetVerticalJustificationToCentered()
+    return actor
+
+
+def create_scatter_actor(
+    inlines: np.ndarray,
+    crosslines: np.ndarray,
+    values: np.ndarray,
+    *,
+    colormap_name: str = DEFAULT_COLORMAP_NAME,
+) -> tuple[vtk.vtkActor, vtk.vtkPolyData, vtk.vtkPolyDataMapper, vtk.vtkLookupTable, tuple[float, float]]:
+    inline_array = np.asarray(inlines, dtype=np.float32).ravel()
+    crossline_array = np.asarray(crosslines, dtype=np.float32).ravel()
+    value_array = np.asarray(values, dtype=np.float32).ravel()
+    if not (inline_array.size and crossline_array.size and value_array.size):
+        raise ValueError("Scatter file is empty.")
+    if not (inline_array.size == crossline_array.size == value_array.size):
+        raise ValueError("Scatter columns must have the same length.")
+
+    points_xyz = np.column_stack(
+        [
+            crossline_array,
+            inline_array,
+            np.zeros_like(value_array, dtype=np.float32),
+        ]
+    ).astype(np.float32, copy=False)
+
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetData(numpy_support.numpy_to_vtk(points_xyz, deep=True))
+    polydata = vtk.vtkPolyData()
+    polydata.SetPoints(vtk_points)
+
+    cells = vtk.vtkCellArray()
+    for index in range(points_xyz.shape[0]):
+        cells.InsertNextCell(1)
+        cells.InsertCellPoint(index)
+    polydata.SetVerts(cells)
+
+    scalars = numpy_support.numpy_to_vtk(value_array, deep=True)
+    scalars.SetName("value")
+    polydata.GetPointData().SetScalars(scalars)
+
+    value_min = float(np.min(value_array))
+    value_max = float(np.max(value_array))
+    if value_min == value_max:
+        value_max = value_min + 1.0
+    value_range = (value_min, value_max)
+
+    lut = vtk.vtkLookupTable()
+    lut.SetRange(*value_range)
+    apply_colormap_preset(lut, colormap_name)
+
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputData(polydata)
+    mapper.SetLookupTable(lut)
+    mapper.SetUseLookupTableScalarRange(True)
+    mapper.SetScalarRange(lut.GetRange())
+    mapper.ScalarVisibilityOn()
+
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetRepresentationToPoints()
+    actor.GetProperty().SetPointSize(6.0)
+    actor.GetProperty().SetOpacity(0.95)
+    return actor, polydata, mapper, lut, value_range
+
+
+def create_grid_image(definition: GridDefinition) -> vtk.vtkImageData:
+    image = vtk.vtkImageData()
+    x_span = float(definition.crossline_end - definition.crossline_start)
+    y_span = float(definition.inline_end - definition.inline_start)
+    z_span = float(definition.sample_end - definition.sample_start)
+    x_dim = 2 if abs(x_span) > 1e-9 else 1
+    y_dim = 2 if abs(y_span) > 1e-9 else 1
+    z_dim = 2 if abs(z_span) > 1e-9 else 1
+    image.SetDimensions(x_dim, y_dim, z_dim)
+    x_spacing = x_span if x_dim > 1 else 1.0
+    y_spacing = y_span if y_dim > 1 else 1.0
+    z_spacing = z_span if z_dim > 1 else 1.0
+    image.SetSpacing(x_spacing, y_spacing, z_spacing)
+    image.SetOrigin(
+        float(definition.crossline_start),
+        float(definition.inline_start),
+        float(definition.sample_start),
+    )
+    scalars = numpy_support.numpy_to_vtk(np.zeros(x_dim * y_dim * z_dim, dtype=np.float32), deep=True)
+    image.GetPointData().SetScalars(scalars)
+    return image
+
+
+def create_grid_actor(definition: GridDefinition) -> vtk.vtkActor:
+    crossline_values = definition.crossline_values
+    inline_values = definition.inline_values
+    sample_values = definition.sample_values
+    x_min = float(crossline_values[0])
+    x_max = float(crossline_values[-1])
+    y_min = float(inline_values[0])
+    y_max = float(inline_values[-1])
+    z_min = float(sample_values[0])
+    z_max = float(sample_values[-1])
+
+    points = vtk.vtkPoints()
+    lines = vtk.vtkCellArray()
+
+    def add_line(x0: float, y0: float, z0: float, x1: float, y1: float, z1: float) -> None:
+        start_id = points.InsertNextPoint(x0, y0, z0)
+        end_id = points.InsertNextPoint(x1, y1, z1)
+        lines.InsertNextCell(2)
+        lines.InsertCellPoint(start_id)
+        lines.InsertCellPoint(end_id)
+
+    # Draw only the outer box edges.
+    add_line(x_min, y_min, z_min, x_max, y_min, z_min)
+    add_line(x_min, y_max, z_min, x_max, y_max, z_min)
+    add_line(x_min, y_min, z_max, x_max, y_min, z_max)
+    add_line(x_min, y_max, z_max, x_max, y_max, z_max)
+
+    add_line(x_min, y_min, z_min, x_min, y_max, z_min)
+    add_line(x_max, y_min, z_min, x_max, y_max, z_min)
+    add_line(x_min, y_min, z_max, x_min, y_max, z_max)
+    add_line(x_max, y_min, z_max, x_max, y_max, z_max)
+
+    add_line(x_min, y_min, z_min, x_min, y_min, z_max)
+    add_line(x_max, y_min, z_min, x_max, y_min, z_max)
+    add_line(x_min, y_max, z_min, x_min, y_max, z_max)
+    add_line(x_max, y_max, z_min, x_max, y_max, z_max)
+
+    polydata = vtk.vtkPolyData()
+    polydata.SetPoints(points)
+    polydata.SetLines(lines)
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputData(polydata)
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetColor(0.36, 0.76, 0.96)
+    actor.GetProperty().SetOpacity(0.22)
+    actor.GetProperty().SetLineWidth(1.0)
     return actor
 
 
@@ -1502,6 +1692,260 @@ class LoadSeismicDialog(QtWidgets.QDialog):
             return None
 
 
+class BuildModelWindow(QtWidgets.QDialog):
+    define_grid_requested = QtCore.Signal()
+    load_dip_direction_requested = QtCore.Signal()
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Build Model")
+        self.setModal(False)
+        self.resize(520, 420)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        header = QtWidgets.QLabel("Build Model")
+        header_font = QtGui.QFont()
+        header_font.setPointSize(16)
+        header_font.setBold(True)
+        header.setFont(header_font)
+        layout.addWidget(header)
+
+        self.settings = QtCore.QSettings("wesi3d", APP_NAME)
+
+        self.grid_group = QtWidgets.QGroupBox("Define Grid")
+        grid_layout = QtWidgets.QVBoxLayout(self.grid_group)
+        grid_layout.setContentsMargins(8, 6, 8, 6)
+        grid_layout.setSpacing(6)
+        grid_form = QtWidgets.QGridLayout()
+        grid_form.setHorizontalSpacing(6)
+        grid_form.setVerticalSpacing(4)
+        float_validator = QtGui.QDoubleValidator(-1e12, 1e12, 6, self)
+
+        self.inline_start_edit = QtWidgets.QLineEdit()
+        self.inline_end_edit = QtWidgets.QLineEdit()
+        self.crossline_start_edit = QtWidgets.QLineEdit()
+        self.crossline_end_edit = QtWidgets.QLineEdit()
+        self.sample_start_edit = QtWidgets.QLineEdit()
+        self.sample_end_edit = QtWidgets.QLineEdit()
+        self.inline_size_edit = QtWidgets.QLineEdit()
+        self.crossline_size_edit = QtWidgets.QLineEdit()
+        self.sample_size_edit = QtWidgets.QLineEdit()
+        for widget in (
+            self.inline_start_edit,
+            self.inline_end_edit,
+            self.crossline_start_edit,
+            self.crossline_end_edit,
+            self.sample_start_edit,
+            self.sample_end_edit,
+            self.inline_size_edit,
+            self.crossline_size_edit,
+            self.sample_size_edit,
+        ):
+            widget.setValidator(float_validator)
+        grid_form.addWidget(QtWidgets.QLabel("Axis"), 0, 0)
+        grid_form.addWidget(QtWidgets.QLabel("Start"), 0, 1)
+        grid_form.addWidget(QtWidgets.QLabel("End"), 0, 2)
+        grid_form.addWidget(QtWidgets.QLabel("Size"), 0, 3)
+        grid_form.addWidget(QtWidgets.QLabel("Inline"), 1, 0)
+        grid_form.addWidget(self.inline_start_edit, 1, 1)
+        grid_form.addWidget(self.inline_end_edit, 1, 2)
+        grid_form.addWidget(self.inline_size_edit, 1, 3)
+        grid_form.addWidget(QtWidgets.QLabel("Cxline"), 2, 0)
+        grid_form.addWidget(self.crossline_start_edit, 2, 1)
+        grid_form.addWidget(self.crossline_end_edit, 2, 2)
+        grid_form.addWidget(self.crossline_size_edit, 2, 3)
+        grid_form.addWidget(QtWidgets.QLabel("Sample"), 3, 0)
+        grid_form.addWidget(self.sample_start_edit, 3, 1)
+        grid_form.addWidget(self.sample_end_edit, 3, 2)
+        grid_form.addWidget(self.sample_size_edit, 3, 3)
+        grid_layout.addLayout(grid_form)
+        self.define_grid_button = QtWidgets.QPushButton("Define Grid")
+        self.define_grid_button.clicked.connect(self.define_grid_requested.emit)
+        grid_layout.addWidget(self.define_grid_button)
+        layout.addWidget(self.grid_group)
+
+        self.scatter_group = QtWidgets.QGroupBox("Load Dip/Direction")
+        scatter_layout = QtWidgets.QVBoxLayout(self.scatter_group)
+        scatter_layout.setContentsMargins(8, 6, 8, 6)
+        scatter_layout.setSpacing(6)
+        scatter_form = QtWidgets.QFormLayout()
+        self.dip_path_edit = QtWidgets.QLineEdit()
+        self.direction_path_edit = QtWidgets.QLineEdit()
+        dip_row = QtWidgets.QHBoxLayout()
+        dip_row.setSpacing(6)
+        dip_row.addWidget(self.dip_path_edit, stretch=1)
+        self.browse_dip_button = QtWidgets.QPushButton("Browse")
+        self.browse_dip_button.setMaximumWidth(72)
+        self.browse_dip_button.clicked.connect(self._browse_dip_path)
+        dip_row.addWidget(self.browse_dip_button)
+        direction_row = QtWidgets.QHBoxLayout()
+        direction_row.setSpacing(6)
+        direction_row.addWidget(self.direction_path_edit, stretch=1)
+        self.browse_direction_button = QtWidgets.QPushButton("Browse")
+        self.browse_direction_button.setMaximumWidth(72)
+        self.browse_direction_button.clicked.connect(self._browse_direction_path)
+        direction_row.addWidget(self.browse_direction_button)
+        scatter_form.addRow("Dip File", dip_row)
+        scatter_form.addRow("Direction File", direction_row)
+        scatter_layout.addLayout(scatter_form)
+        self.load_dip_direction_button = QtWidgets.QPushButton("Load Dip/Direction")
+        self.load_dip_direction_button.clicked.connect(self.load_dip_direction_requested.emit)
+        scatter_layout.addWidget(self.load_dip_direction_button)
+        layout.addWidget(self.scatter_group, stretch=1)
+
+        self.close_button = QtWidgets.QPushButton("Close")
+        self.close_button.clicked.connect(self.hide)
+        layout.addWidget(self.close_button)
+
+        self._load_history()
+
+    def _load_history(self) -> None:
+        self.inline_start_edit.setText(str(self.settings.value("build_model/grid/inline_start", "0")))
+        self.inline_end_edit.setText(str(self.settings.value("build_model/grid/inline_end", "100")))
+        self.crossline_start_edit.setText(str(self.settings.value("build_model/grid/crossline_start", "0")))
+        self.crossline_end_edit.setText(str(self.settings.value("build_model/grid/crossline_end", "100")))
+        self.sample_start_edit.setText(str(self.settings.value("build_model/grid/sample_start", "0")))
+        self.sample_end_edit.setText(str(self.settings.value("build_model/grid/sample_end", "60")))
+        self.inline_size_edit.setText(str(self.settings.value("build_model/grid/inline_size", "10")))
+        self.crossline_size_edit.setText(str(self.settings.value("build_model/grid/crossline_size", "10")))
+        self.sample_size_edit.setText(str(self.settings.value("build_model/grid/sample_size", "10")))
+        self.dip_path_edit.setText(str(self.settings.value("build_model/scatter/dip_path", "")))
+        self.direction_path_edit.setText(str(self.settings.value("build_model/scatter/direction_path", "")))
+
+    def save_grid_history(self, definition: GridDefinition) -> None:
+        self.settings.setValue("build_model/grid/inline_start", definition.inline_start)
+        self.settings.setValue("build_model/grid/inline_end", definition.inline_end)
+        self.settings.setValue("build_model/grid/crossline_start", definition.crossline_start)
+        self.settings.setValue("build_model/grid/crossline_end", definition.crossline_end)
+        self.settings.setValue("build_model/grid/sample_start", definition.sample_start)
+        self.settings.setValue("build_model/grid/sample_end", definition.sample_end)
+        self.settings.setValue("build_model/grid/inline_size", definition.inline_size)
+        self.settings.setValue("build_model/grid/crossline_size", definition.crossline_size)
+        self.settings.setValue("build_model/grid/sample_size", definition.sample_size)
+
+    def save_scatter_history(self, dip_path: str, direction_path: str) -> None:
+        self.settings.setValue("build_model/scatter/dip_path", dip_path)
+        self.settings.setValue("build_model/scatter/direction_path", direction_path)
+
+    def current_grid_definition(self) -> GridDefinition | None:
+        try:
+            return GridDefinition(
+                inline_start=float(self.inline_start_edit.text().strip() or "0"),
+                inline_end=float(self.inline_end_edit.text().strip() or "0"),
+                crossline_start=float(self.crossline_start_edit.text().strip() or "0"),
+                crossline_end=float(self.crossline_end_edit.text().strip() or "0"),
+                sample_start=float(self.sample_start_edit.text().strip() or "0"),
+                sample_end=float(self.sample_end_edit.text().strip() or "0"),
+                inline_size=max(1e-6, abs(float(self.inline_size_edit.text().strip() or "1"))),
+                crossline_size=max(1e-6, abs(float(self.crossline_size_edit.text().strip() or "1"))),
+                sample_size=max(1e-6, abs(float(self.sample_size_edit.text().strip() or "1"))),
+            )
+        except ValueError:
+            return None
+
+    def current_scatter_paths(self) -> tuple[str, str]:
+        return self.dip_path_edit.text().strip(), self.direction_path_edit.text().strip()
+
+    def _browse_dip_path(self) -> None:
+        start_dir = str(Path(self.dip_path_edit.text().strip()).expanduser().parent) if self.dip_path_edit.text().strip() else ""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Dip File",
+            start_dir,
+            "GMP Files (*.gmp);;Text Files (*.txt *.dat *.csv);;All Files (*)",
+        )
+        if path:
+            self.dip_path_edit.setText(path)
+            self.save_scatter_history(path, self.direction_path_edit.text().strip())
+
+    def _browse_direction_path(self) -> None:
+        start_dir = str(Path(self.direction_path_edit.text().strip()).expanduser().parent) if self.direction_path_edit.text().strip() else ""
+        if not start_dir and self.dip_path_edit.text().strip():
+            start_dir = str(Path(self.dip_path_edit.text().strip()).expanduser().parent)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Direction File",
+            start_dir,
+            "GMP Files (*.gmp);;Text Files (*.txt *.dat *.csv);;All Files (*)",
+        )
+        if path:
+            self.direction_path_edit.setText(path)
+            self.save_scatter_history(self.dip_path_edit.text().strip(), path)
+
+
+class DefineGridDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Define Grid")
+        self.setModal(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+
+        float_validator = QtGui.QDoubleValidator(-1e12, 1e12, 6, self)
+
+        self.inline_start_edit = QtWidgets.QLineEdit("0")
+        self.inline_end_edit = QtWidgets.QLineEdit("100")
+        self.crossline_start_edit = QtWidgets.QLineEdit("0")
+        self.crossline_end_edit = QtWidgets.QLineEdit("100")
+        self.sample_start_edit = QtWidgets.QLineEdit("0")
+        self.sample_end_edit = QtWidgets.QLineEdit("60")
+        self.inline_size_edit = QtWidgets.QLineEdit("10")
+        self.crossline_size_edit = QtWidgets.QLineEdit("10")
+        self.sample_size_edit = QtWidgets.QLineEdit("10")
+
+        for widget in (
+            self.inline_start_edit,
+            self.inline_end_edit,
+            self.crossline_start_edit,
+            self.crossline_end_edit,
+            self.sample_start_edit,
+            self.sample_end_edit,
+            self.inline_size_edit,
+            self.crossline_size_edit,
+            self.sample_size_edit,
+        ):
+            widget.setValidator(float_validator)
+
+        form.addRow("Inline Start", self.inline_start_edit)
+        form.addRow("Inline End", self.inline_end_edit)
+        form.addRow("Cxline Start", self.crossline_start_edit)
+        form.addRow("Cxline End", self.crossline_end_edit)
+        form.addRow("Sample Start", self.sample_start_edit)
+        form.addRow("Sample End", self.sample_end_edit)
+        form.addRow("Inline Grid Size", self.inline_size_edit)
+        form.addRow("Cxline Grid Size", self.crossline_size_edit)
+        form.addRow("Sample Grid Size", self.sample_size_edit)
+        layout.addLayout(form)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> GridDefinition | None:
+        try:
+            return GridDefinition(
+                inline_start=float(self.inline_start_edit.text().strip() or "0"),
+                inline_end=float(self.inline_end_edit.text().strip() or "0"),
+                crossline_start=float(self.crossline_start_edit.text().strip() or "0"),
+                crossline_end=float(self.crossline_end_edit.text().strip() or "0"),
+                sample_start=float(self.sample_start_edit.text().strip() or "0"),
+                sample_end=float(self.sample_end_edit.text().strip() or "0"),
+                inline_size=max(1e-6, abs(float(self.inline_size_edit.text().strip() or "1"))),
+                crossline_size=max(1e-6, abs(float(self.crossline_size_edit.text().strip() or "1"))),
+                sample_size=max(1e-6, abs(float(self.sample_size_edit.text().strip() or "1"))),
+            )
+        except ValueError:
+            return None
+
+
 class SliceUpdater:
     def __init__(
         self,
@@ -1527,8 +1971,13 @@ class SliceUpdater:
         self.opacity = opacity
         self.attributes: dict[str, AttributeVolume] = {}
         self.horizons: dict[str, HorizonSurface] = {}
+        self.scatter_sets: dict[str, ScatterDataSet] = {}
+        self.grid_definition: GridDefinition | None = None
+        self.grid_image: vtk.vtkImageData | None = None
+        self.grid_actor: vtk.vtkActor | None = None
         self.current_horizon_name: str | None = None
         self.current_attribute_name: str | None = None
+        self.current_scatter_name: str | None = None
         self.last_rebuild_error: str | None = None
         self.image = bundles["xline"].image
         self.xlines = np.asarray([0.0], dtype=np.float32)
@@ -1564,14 +2013,27 @@ class SliceUpdater:
     def _sync_axes_from_current_attribute(self) -> None:
         attribute = self.current_attribute()
         if attribute is None:
-            self.xlines = np.asarray([0.0], dtype=np.float32)
-            self.inlines = np.asarray([0.0], dtype=np.float32)
-            self.samples = np.asarray([0.0], dtype=np.float32)
+            if self.grid_definition is not None:
+                self.xlines = self.grid_definition.crossline_values
+                self.inlines = self.grid_definition.inline_values
+                self.samples = self.grid_definition.sample_values
+            else:
+                self.xlines = np.asarray([0.0], dtype=np.float32)
+                self.inlines = np.asarray([0.0], dtype=np.float32)
+                self.samples = np.asarray([0.0], dtype=np.float32)
             return
         volume_data = attribute.volume_data
         self.xlines = volume_data.xlines
         self.inlines = volume_data.inlines
         self.samples = volume_data.samples
+
+    def scene_image(self) -> vtk.vtkImageData:
+        attribute = self.current_attribute()
+        if attribute is not None:
+            return attribute.image
+        if self.grid_image is not None:
+            return self.grid_image
+        return self.image
 
     def current_text(self) -> str:
         if not self.has_attribute_data():
@@ -1616,6 +2078,9 @@ class SliceUpdater:
     def horizon_names(self) -> list[str]:
         return list(self.horizons.keys())
 
+    def scatter_names(self) -> list[str]:
+        return list(self.scatter_sets.keys())
+
     def current_attribute_opacity(self) -> float:
         attribute = self.current_attribute()
         if attribute is None:
@@ -1635,6 +2100,11 @@ class SliceUpdater:
             return None
         return self.horizons[self.current_horizon_name]
 
+    def current_scatter(self) -> ScatterDataSet | None:
+        if self.current_scatter_name is None:
+            return None
+        return self.scatter_sets.get(self.current_scatter_name)
+
     def set_index(self, orientation: str, index: int, render: bool = True) -> None:
         if not self.has_attribute_data():
             return
@@ -1653,6 +2123,7 @@ class SliceUpdater:
     def set_attribute(self, name: str, render: bool = True) -> None:
         if name not in self.attributes:
             raise KeyError(f"Unknown attribute: {name}")
+        self.set_current_scatter(None, render=False)
         attr = self.attributes[name]
         self.current_attribute_name = name
         self.image = attr.image
@@ -1807,6 +2278,7 @@ class SliceUpdater:
         return new_names
 
     def set_current_horizon(self, name: str | None, render: bool = True) -> None:
+        self.set_current_scatter(None, render=False)
         self.current_horizon_name = name
         for horizon_name, horizon in self.horizons.items():
             prop = horizon.actor.GetProperty()
@@ -1835,6 +2307,17 @@ class SliceUpdater:
                 point_set.master_actor.SetVisibility(point_set.visible)
                 point_set.linked_master_actor.SetVisibility(False)
                 point_set.selected_master_actor.SetVisibility(False)
+        self.refresh_scalar_bar()
+        if render:
+            self.interactor.GetRenderWindow().Render()
+
+    def set_current_scatter(self, name: str | None, render: bool = True) -> None:
+        self.current_scatter_name = name if name in self.scatter_sets else None
+        for scatter_name, scatter in self.scatter_sets.items():
+            is_current = scatter_name == self.current_scatter_name
+            scatter.actor.GetProperty().SetPointSize(8.0 if is_current else 6.0)
+            scatter.actor.GetProperty().SetOpacity((1.0 if is_current else 0.82) if scatter.visible else 0.0)
+            scatter.actor.SetVisibility(scatter.visible)
         self.refresh_scalar_bar()
         if render:
             self.interactor.GetRenderWindow().Render()
@@ -2149,6 +2632,58 @@ class SliceUpdater:
         self.set_current_horizon(new_name if select else self.current_horizon_name, render=False)
         return new_name
 
+    def add_scatter_data(
+        self,
+        name: str,
+        *,
+        inlines: np.ndarray,
+        crosslines: np.ndarray,
+        values: np.ndarray,
+        source_path: Path,
+        select: bool = False,
+    ) -> str:
+        actor, polydata, mapper, lut, value_range = create_scatter_actor(inlines, crosslines, values)
+        new_name = self._unique_name(self.scatter_sets, name)
+        dataset = ScatterDataSet(
+            name=new_name,
+            actor=actor,
+            polydata=polydata,
+            mapper=mapper,
+            lut=lut,
+            value_range=value_range,
+            inlines=np.asarray(inlines, dtype=np.float32).ravel(),
+            crosslines=np.asarray(crosslines, dtype=np.float32).ravel(),
+            values=np.asarray(values, dtype=np.float32).ravel(),
+            source_path=Path(source_path),
+            visible=True,
+        )
+        self.scatter_sets[new_name] = dataset
+        self.renderer.AddActor(actor)
+        self.set_current_scatter(new_name if select else self.current_scatter_name, render=False)
+        return new_name
+
+    def set_grid_definition(self, definition: GridDefinition, render: bool = True) -> None:
+        crossline_values = definition.crossline_values
+        inline_values = definition.inline_values
+        sample_values = definition.sample_values
+        self.grid_definition = definition
+        self.spacing = RenderSpacing(
+            xline=float(definition.crossline_size),
+            inline=float(definition.inline_size),
+            sample=float(definition.sample_size),
+        )
+        self.grid_image = create_grid_image(definition)
+        self.image = self.grid_image
+        self._sync_axes_from_current_attribute()
+        if self.grid_actor is not None:
+            self.renderer.RemoveActor(self.grid_actor)
+        self.grid_actor = create_grid_actor(definition)
+        self.renderer.AddActor(self.grid_actor)
+        self.update_overlay()
+        self.refresh_scalar_bar()
+        if render:
+            self.interactor.GetRenderWindow().Render()
+
     def _build_control_point_set(
         self,
         name: str,
@@ -2320,6 +2855,15 @@ class SliceUpdater:
         if self.current_horizon_name == name:
             next_name = next(iter(self.horizons), None)
             self.set_current_horizon(next_name, render=False)
+        return True
+
+    def remove_scatter(self, name: str) -> bool:
+        scatter = self.scatter_sets.pop(name, None)
+        if scatter is None:
+            return False
+        self.renderer.RemoveActor(scatter.actor)
+        if self.current_scatter_name == name:
+            self.set_current_scatter(next(iter(self.scatter_sets), None), render=False)
         return True
 
     def current_control_point_display_scale(self) -> float | None:
@@ -2622,8 +3166,12 @@ class SliceUpdater:
     def refresh_scalar_bar(self) -> None:
         lut: vtk.vtkLookupTable | None = None
         title = ""
+        scatter = self.current_scatter()
         point_set = self.current_control_point_set()
-        if (
+        if scatter is not None:
+            lut = scatter.lut
+            title = f"Scatter\n{scatter.name}"
+        elif (
             point_set is not None
             and point_set.use_attribute_colormap
         ):
@@ -2670,6 +3218,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self._prop_picker = vtk.vtkPropPicker()
         self.data_panel = DataPanelWidget(self)
         self._selected_data_item: tuple[str, str] | None = None
+        self.build_model_window: BuildModelWindow | None = None
 
         self.setWindowTitle(APP_NAME)
         self.resize(1920, 1400)
@@ -2733,6 +3282,10 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.replace_volume_button = QtWidgets.QPushButton("Replace By Horizon")
         self.replace_volume_button.clicked.connect(self.open_replace_volume_dialog)
         panel_layout.addWidget(self.replace_volume_button)
+
+        self.build_model_button = QtWidgets.QPushButton("Build Model")
+        self.build_model_button.clicked.connect(self.open_build_model_window)
+        panel_layout.addWidget(self.build_model_button)
 
         attribute_display_group = ColorMapControlWidget("Colormap")
         self.attribute_colormap_widget = attribute_display_group
@@ -2921,9 +3474,9 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.render_window.Render()
 
     def reset_view(self) -> None:
-        if not self.updater.has_attribute_data():
+        if not self.updater.has_attribute_data() and self.updater.grid_image is None:
             return
-        configure_default_camera(self.renderer, self.image)
+        configure_default_camera(self.renderer, self.updater.scene_image())
         self.schedule_render()
         debug_log(self.debug_ui, "camera reset to default view")
 
@@ -2945,9 +3498,10 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self.renderer.RemoveActor(self.outline_actor)
         for actor in self.axis_texts:
             self.renderer.RemoveActor(actor)
-        self.outline_actor = create_outline(self.updater.image)
+        scene_image = self.updater.scene_image()
+        self.outline_actor = create_outline(scene_image)
         self.axis_texts = create_axis_labels(
-            self.updater.image,
+            scene_image,
             self.updater.xlines,
             self.updater.inlines,
             self.updater.samples,
@@ -3084,6 +3638,14 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                 )
                 for name in self.updater.horizon_names()
             ],
+            "scatter": [
+                DataPanelItem(
+                    category="scatter",
+                    name=name,
+                    label=f"{name} ({len(self.updater.scatter_sets[name].values)} pts)",
+                )
+                for name in self.updater.scatter_names()
+            ],
             "well": [],
         }
         self.data_panel.set_items(items)
@@ -3106,6 +3668,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self._selected_master_point_index = None
             self._linked_master_point_indices.clear()
             self._refresh_selected_master_actor()
+        elif category == "scatter":
+            self.updater.set_current_scatter(name, render=False)
         self.refresh_info()
         self.refresh_data_panel()
         self.schedule_render()
@@ -3337,6 +3901,80 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         if values is None:
             return
         self.load_segy_volume(values)
+
+    def open_build_model_window(self) -> None:
+        if self.build_model_window is None:
+            self.build_model_window = BuildModelWindow(self)
+            self.build_model_window.define_grid_requested.connect(self.open_define_grid_dialog)
+            self.build_model_window.load_dip_direction_requested.connect(self.open_load_dip_direction_dialog)
+        self.build_model_window.show()
+        self.build_model_window.raise_()
+        self.build_model_window.activateWindow()
+
+    def open_define_grid_dialog(self) -> None:
+        if self.build_model_window is None:
+            return
+        definition = self.build_model_window.current_grid_definition()
+        if definition is None:
+            QtWidgets.QMessageBox.information(self, "Invalid Grid", "Please enter valid grid parameters.")
+            return
+        self.build_model_window.save_grid_history(definition)
+        self.updater.set_grid_definition(definition, render=False)
+        self.image = self.updater.scene_image()
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        configure_default_camera(self.renderer, self.updater.scene_image())
+        self.refresh_info()
+        self.refresh_data_panel()
+        self.schedule_render()
+
+    @staticmethod
+    def _read_scatter_gmp(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        try:
+            data = np.loadtxt(path, dtype=np.float32)
+        except Exception as exc:
+            raise ValueError(f"Failed to read scatter file: {path.name}") from exc
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        if data.ndim != 2 or data.shape[1] < 3:
+            raise ValueError(f"Scatter file must contain three columns: {path.name}")
+        return data[:, 0], data[:, 1], data[:, 2]
+
+    def open_load_dip_direction_dialog(self) -> None:
+        if self.build_model_window is None:
+            return
+        dip_path_text, direction_path_text = self.build_model_window.current_scatter_paths()
+        if not dip_path_text or not direction_path_text:
+            QtWidgets.QMessageBox.information(self, "Missing Files", "Please select both dip and direction files.")
+            return
+        self.build_model_window.save_scatter_history(dip_path_text, direction_path_text)
+        try:
+            dip_inlines, dip_crosslines, dip_values = self._read_scatter_gmp(Path(dip_path_text))
+            direction_inlines, direction_crosslines, direction_values = self._read_scatter_gmp(Path(direction_path_text))
+        except ValueError as exc:
+            QtWidgets.QMessageBox.information(self, "Load Failed", str(exc))
+            return
+
+        dip_name = self.updater.add_scatter_data(
+            Path(dip_path_text).stem,
+            inlines=dip_inlines,
+            crosslines=dip_crosslines,
+            values=dip_values,
+            source_path=Path(dip_path_text),
+            select=True,
+        )
+        self.updater.add_scatter_data(
+            Path(direction_path_text).stem,
+            inlines=direction_inlines,
+            crosslines=direction_crosslines,
+            values=direction_values,
+            source_path=Path(direction_path_text),
+            select=False,
+        )
+        self._selected_data_item = ("scatter", dip_name)
+        self.refresh_data_panel()
+        self.schedule_render()
 
     def load_segy_volume(self, values: dict[str, object]) -> None:
         segy_path = Path(str(values["path"])).expanduser().resolve()
@@ -3635,6 +4273,10 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self.activate_data_item("horizon", name)
             return
 
+        if category == "scatter":
+            self.open_load_dip_direction_dialog()
+            return
+
         QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据加载尚未实现。")
 
     def store_data_item(self, category: str, name: str) -> None:
@@ -3722,6 +4364,25 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                 np.savez_compressed(path, **payload)
             return
 
+        if category == "scatter":
+            scatter = self.updater.scatter_sets[name]
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Store Scatter",
+                str(self._default_output_dir(category) / f"{name}.npz"),
+                "NumPy Archive (*.npz)",
+            )
+            if path:
+                np.savez_compressed(
+                    path,
+                    name=np.array(scatter.name),
+                    inlines=np.asarray(scatter.inlines, dtype=np.float32),
+                    crosslines=np.asarray(scatter.crosslines, dtype=np.float32),
+                    values=np.asarray(scatter.values, dtype=np.float32),
+                    source_path=np.array(str(scatter.source_path)),
+                )
+            return
+
         QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据存储尚未实现。")
 
     def unload_data_item(self, category: str, name: str) -> None:
@@ -3731,6 +4392,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self.image = self.updater.image
         elif category == "horizon":
             removed = self.updater.remove_horizon(name)
+        elif category == "scatter":
+            removed = self.updater.remove_scatter(name)
         else:
             QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据卸载尚未实现。")
             return
@@ -3739,14 +4402,21 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Unload Failed", "当前数据无法卸载。")
             return
 
-        current_attribute = self.updater.current_attribute()
-        fallback_category = str(
-            current_attribute.volume_data.metadata.get(
-                "panel_category",
-                "seismic" if self.updater.current_attribute_name == "seismic" else "attribute",
-            )
-        )
-        self._selected_data_item = (fallback_category, self.updater.current_attribute_name)
+        current_scatter = self.updater.current_scatter()
+        if current_scatter is not None:
+            self._selected_data_item = ("scatter", current_scatter.name)
+        else:
+            current_attribute = self.updater.current_attribute()
+            if current_attribute is not None and self.updater.current_attribute_name is not None:
+                fallback_category = str(
+                    current_attribute.volume_data.metadata.get(
+                        "panel_category",
+                        "seismic" if self.updater.current_attribute_name == "seismic" else "attribute",
+                    )
+                )
+                self._selected_data_item = (fallback_category, self.updater.current_attribute_name)
+            else:
+                self._selected_data_item = None
         self.refresh_axis_controls()
         self.refresh_scene_guides()
         self.refresh_info()
