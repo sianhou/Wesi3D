@@ -983,7 +983,8 @@ def build_extruded_polygon_surface(
     closed_surface = False
     target_depth_value = float(target_depth)
     vertical_step = max(1e-3, float(layer_step))
-    stabilization_iterations = max(1, int(smooth_iterations) + 1)
+    smooth_iteration_count = max(0, int(smooth_iterations))
+    stabilization_iterations = max(0, smooth_iteration_count + 1) if smooth_iteration_count > 0 else 0
 
     max_iterations = max(1, int(np.ceil(max(target_depth_value - float(np.min(boundary_z)), 0.0) / vertical_step)) + 2)
     for _ in range(max_iterations):
@@ -1003,8 +1004,9 @@ def build_extruded_polygon_surface(
             direction_values,
             current_boundary_points,
         )
-        dips_deg = np.clip(smooth_closed_scalar(dips_deg, stabilization_iterations), 1.0, 89.0)
-        directions_deg = smooth_closed_angles_deg(directions_deg, stabilization_iterations)
+        if stabilization_iterations > 0:
+            dips_deg = np.clip(smooth_closed_scalar(dips_deg, stabilization_iterations), 1.0, 89.0)
+            directions_deg = smooth_closed_angles_deg(directions_deg, stabilization_iterations)
 
         directions_rad = np.deg2rad(directions_deg)
         dips_rad = np.deg2rad(dips_deg)
@@ -1021,13 +1023,15 @@ def build_extruded_polygon_surface(
         next_layer[:, 0] = next_layer[:, 0] + horizontal_step * np.sin(directions_rad)
         next_layer[:, 1] = next_layer[:, 1] + horizontal_step * np.cos(directions_rad)
         next_layer[:, 2] = np.minimum(next_layer[:, 2] + vertical_step_vector, target_depth_value)
-        next_layer = smooth_closed_curve(next_layer, smooth_iterations)
+        if smooth_iteration_count > 0:
+            next_layer = smooth_closed_curve(next_layer, smooth_iteration_count)
         next_layer[:, 2] = np.minimum(next_layer[:, 2], target_depth_value)
 
         intersection_loop = find_self_intersection_loop(next_layer)
         if intersection_loop is not None and intersection_loop.shape[0] >= 3:
             closed_loop = resample_closed_xyz_curve(intersection_loop, point_total)
-            closed_loop = smooth_closed_curve(closed_loop, max(2, smooth_iterations + 2))
+            if smooth_iteration_count > 0:
+                closed_loop = smooth_closed_curve(closed_loop, max(2, smooth_iteration_count + 2))
             next_layer = resample_closed_xyz_curve(closed_loop, point_total)
             closed_surface = True
             surface_layers.append(np.asarray(next_layer, dtype=np.float32))
@@ -1087,15 +1091,19 @@ def build_extruded_polygon_surface(
         cleaner = vtk.vtkCleanPolyData()
         cleaner.SetInputConnection(append.GetOutputPort())
         cleaner.Update()
-        smoother = vtk.vtkSmoothPolyDataFilter()
-        smoother.SetInputConnection(cleaner.GetOutputPort())
-        smoother.SetNumberOfIterations(max(12, smooth_iterations * 6))
-        smoother.SetRelaxationFactor(0.08)
-        smoother.FeatureEdgeSmoothingOff()
-        smoother.BoundarySmoothingOn()
-        smoother.Update()
-        combined_polydata = vtk.vtkPolyData()
-        combined_polydata.DeepCopy(smoother.GetOutput())
+        if smooth_iteration_count > 0:
+            smoother = vtk.vtkSmoothPolyDataFilter()
+            smoother.SetInputConnection(cleaner.GetOutputPort())
+            smoother.SetNumberOfIterations(max(12, smooth_iteration_count * 6))
+            smoother.SetRelaxationFactor(0.08)
+            smoother.FeatureEdgeSmoothingOff()
+            smoother.BoundarySmoothingOn()
+            smoother.Update()
+            combined_polydata = vtk.vtkPolyData()
+            combined_polydata.DeepCopy(smoother.GetOutput())
+        else:
+            combined_polydata = vtk.vtkPolyData()
+            combined_polydata.DeepCopy(cleaner.GetOutput())
 
     normals = vtk.vtkPolyDataNormals()
     normals.SetInputData(combined_polydata)
@@ -1125,6 +1133,256 @@ def create_model_surface_actor(
     actor.GetProperty().SetInterpolationToPhong()
     actor.GetProperty().EdgeVisibilityOff()
     return actor, mapper
+
+
+def sample_polydata_surface_depth(
+    polydata: vtk.vtkPolyData,
+    inline_values: np.ndarray,
+    crossline_values: np.ndarray,
+    sample_min: float,
+    sample_max: float,
+) -> np.ndarray:
+    locator = vtk.vtkOBBTree()
+    locator.SetDataSet(polydata)
+    locator.BuildLocator()
+
+    sampled = np.full((len(inline_values), len(crossline_values)), np.nan, dtype=np.float32)
+    line_start_z = float(min(sample_min, sample_max))
+    line_end_z = float(max(sample_min, sample_max))
+
+    for inline_index, inline_value in enumerate(np.asarray(inline_values, dtype=np.float32)):
+        for crossline_index, crossline_value in enumerate(np.asarray(crossline_values, dtype=np.float32)):
+            points = vtk.vtkPoints()
+            cell_ids = vtk.vtkIdList()
+            hit_count = locator.IntersectWithLine(
+                (float(crossline_value), float(inline_value), line_start_z),
+                (float(crossline_value), float(inline_value), line_end_z),
+                points,
+                cell_ids,
+            )
+            if hit_count <= 0 or points.GetNumberOfPoints() == 0:
+                continue
+            z_hits = [float(points.GetPoint(hit_index)[2]) for hit_index in range(points.GetNumberOfPoints())]
+            # For closed/partially closed surfaces we want the deepest envelope
+            # intersection, not the first shallow hit on a side wall.
+            sampled[inline_index, crossline_index] = float(np.max(z_hits))
+    return sampled
+
+
+def extract_slice_polygons(
+    polydata: vtk.vtkPolyData,
+    z_value: float,
+) -> list[np.ndarray]:
+    if polydata.GetNumberOfPoints() == 0 or polydata.GetNumberOfPolys() == 0:
+        return []
+
+    plane = vtk.vtkPlane()
+    plane.SetOrigin(0.0, 0.0, float(z_value))
+    plane.SetNormal(0.0, 0.0, 1.0)
+
+    cutter = vtk.vtkCutter()
+    cutter.SetInputData(polydata)
+    cutter.SetCutFunction(plane)
+    cutter.Update()
+
+    stripped_input = cutter.GetOutput()
+    if stripped_input.GetNumberOfPoints() == 0 or stripped_input.GetNumberOfLines() == 0:
+        return []
+
+    stripper = vtk.vtkStripper()
+    stripper.SetInputData(stripped_input)
+    stripper.JoinContiguousSegmentsOn()
+    stripper.Update()
+
+    stripped = stripper.GetOutput()
+    points = stripped.GetPoints()
+    lines = stripped.GetLines()
+    if points is None or lines is None or stripped.GetNumberOfLines() == 0:
+        return []
+
+    polygons: list[np.ndarray] = []
+    id_list = vtk.vtkIdList()
+    lines.InitTraversal()
+    while lines.GetNextCell(id_list):
+        if id_list.GetNumberOfIds() < 3:
+            continue
+        polygon_points: list[tuple[float, float]] = []
+        for point_index in range(id_list.GetNumberOfIds()):
+            x_value, y_value, _ = points.GetPoint(id_list.GetId(point_index))
+            polygon_points.append((float(x_value), float(y_value)))
+        polygon = np.asarray(polygon_points, dtype=np.float32)
+        if polygon.shape[0] >= 2 and np.linalg.norm(polygon[0] - polygon[-1]) <= 1e-4:
+            polygon = polygon[:-1]
+        if polygon.shape[0] < 3:
+            continue
+        polygons.append(polygon)
+    return polygons
+
+
+def polygon_mask_on_grid(
+    polygon_xy: np.ndarray,
+    grid_x: np.ndarray,
+    grid_y: np.ndarray,
+) -> np.ndarray:
+    polygon = np.asarray(polygon_xy, dtype=np.float32)
+    if polygon.ndim != 2 or polygon.shape[0] < 3:
+        return np.zeros(grid_x.shape, dtype=bool)
+
+    x_coords = polygon[:, 0]
+    y_coords = polygon[:, 1]
+    query_x = np.asarray(grid_x, dtype=np.float32).ravel()
+    query_y = np.asarray(grid_y, dtype=np.float32).ravel()
+    inside = np.zeros(query_x.shape, dtype=bool)
+
+    prev_index = polygon.shape[0] - 1
+    for curr_index in range(polygon.shape[0]):
+        x0 = float(x_coords[prev_index])
+        y0 = float(y_coords[prev_index])
+        x1 = float(x_coords[curr_index])
+        y1 = float(y_coords[curr_index])
+        crosses = (y0 > query_y) != (y1 > query_y)
+        if abs(y1 - y0) <= 1e-12:
+            prev_index = curr_index
+            continue
+        x_intersections = ((x1 - x0) * (query_y - y0) / (y1 - y0)) + x0
+        inside ^= crosses & (query_x <= x_intersections)
+        prev_index = curr_index
+
+    return inside.reshape(grid_x.shape)
+
+
+def polygon_signed_area_xy(polygon_xy: np.ndarray) -> float:
+    polygon = np.asarray(polygon_xy, dtype=np.float32)
+    if polygon.ndim != 2 or polygon.shape[0] < 3:
+        return 0.0
+    x_values = polygon[:, 0]
+    y_values = polygon[:, 1]
+    return 0.5 * float(
+        np.sum(x_values * np.roll(y_values, -1) - np.roll(x_values, -1) * y_values)
+    )
+
+
+def fill_model_volume_from_surfaces(
+    sample_values: np.ndarray,
+    elev_depths: np.ndarray,
+    model_masks: list[tuple[int, np.ndarray]],
+) -> np.ndarray:
+    samples = np.asarray(sample_values, dtype=np.float32).ravel()
+    output = np.zeros((elev_depths.shape[0], elev_depths.shape[1], samples.size), dtype=np.float32)
+    sample_min = float(np.min(samples))
+    sample_max = float(np.max(samples))
+
+    for inline_index in range(elev_depths.shape[0]):
+        for crossline_index in range(elev_depths.shape[1]):
+            top_depth = float(elev_depths[inline_index, crossline_index])
+            if np.isnan(top_depth):
+                continue
+            top_depth = min(max(top_depth, sample_min), sample_max)
+            output[inline_index, crossline_index, samples <= top_depth] = -1.0
+
+    for model_id, model_mask in model_masks:
+        mask_array = np.asarray(model_mask, dtype=bool)
+        if mask_array.shape != output.shape:
+            if mask_array.ndim == 3 and mask_array.shape == (output.shape[1], output.shape[0], output.shape[2]):
+                mask_array = np.transpose(mask_array, (1, 0, 2))
+            else:
+                raise ValueError(
+                    f"model mask shape {mask_array.shape} does not match output shape {output.shape}"
+                )
+        output[mask_array] = float(model_id)
+
+    return output
+
+
+def build_model_mask_volume(
+    sample_values: np.ndarray,
+    inline_values: np.ndarray,
+    crossline_values: np.ndarray,
+    polydata: vtk.vtkPolyData,
+    *,
+    debug_label: str = "model",
+) -> np.ndarray:
+    samples = np.asarray(sample_values, dtype=np.float32).ravel()
+    output = np.zeros((len(inline_values), len(crossline_values), samples.size), dtype=np.float32)
+    grid_x, grid_y = np.meshgrid(
+        np.asarray(crossline_values, dtype=np.float32),
+        np.asarray(inline_values, dtype=np.float32),
+        indexing="xy",
+    )
+
+    points_data = polydata.GetPoints()
+    if points_data is None or points_data.GetData() is None:
+        return output
+    surface_points = np.asarray(numpy_support.vtk_to_numpy(points_data.GetData()), dtype=np.float32)
+    if surface_points.size == 0:
+        return output
+    z_min = float(np.min(surface_points[:, 2]))
+    z_max = float(np.max(surface_points[:, 2]))
+    dx = float(abs(crossline_values[1] - crossline_values[0])) if len(crossline_values) > 1 else 1.0
+    dy = float(abs(inline_values[1] - inline_values[0])) if len(inline_values) > 1 else 1.0
+    cell_area = max(dx * dy, 1e-6)
+    print(
+        f"[Build Model Mask] source summary: name={debug_label} "
+        f"points={polydata.GetNumberOfPoints()} polys={polydata.GetNumberOfPolys()} "
+        f"z_range=({z_min:.3f}, {z_max:.3f}) "
+        f"grid=({len(crossline_values)}x{len(inline_values)}x{len(samples)}) "
+        f"cell_size=({dx:.3f}x{dy:.3f})",
+        flush=True,
+    )
+
+    logged_slice_count = 0
+    active_slice_count = 0
+    total_slice_voxels = 0
+
+    for sample_index, sample_value in enumerate(samples):
+        if sample_value < z_min - 1e-4 or sample_value > z_max + 1e-4:
+            continue
+        polygons = extract_slice_polygons(polydata, float(sample_value))
+        if not polygons:
+            continue
+        active_slice_count += 1
+        slice_mask = np.zeros((len(inline_values), len(crossline_values)), dtype=bool)
+        polygon_vertex_counts: list[int] = []
+        polygon_bbox_summaries: list[str] = []
+        polygon_area_summaries: list[str] = []
+        for polygon in polygons:
+            polygon_vertex_counts.append(int(polygon.shape[0]))
+            polygon_area = abs(polygon_signed_area_xy(polygon))
+            polygon_area_summaries.append(
+                f"{polygon_area:.1f}->{polygon_area / cell_area:.2f}cells"
+            )
+            polygon_bbox_summaries.append(
+                f"({float(np.min(polygon[:, 0])):.1f},{float(np.max(polygon[:, 0])):.1f})x"
+                f"({float(np.min(polygon[:, 1])):.1f},{float(np.max(polygon[:, 1])):.1f})"
+            )
+            slice_mask ^= polygon_mask_on_grid(polygon, grid_x, grid_y)
+        filled_cells = int(np.count_nonzero(slice_mask))
+        total_slice_voxels += filled_cells
+        output[:, :, sample_index][slice_mask] = 1.0
+        should_log = (
+            logged_slice_count < 12
+            or filled_cells <= 3
+            or (polygons and max(polygon_vertex_counts, default=0) >= 100)
+            or sample_index in {0, len(samples) // 2, len(samples) - 1}
+        )
+        if should_log:
+            print(
+                f"[Build Model Mask] slice sample_idx={sample_index} z={float(sample_value):.3f} "
+                f"polygons={len(polygons)} vertices={polygon_vertex_counts} "
+                f"filled_cells={filled_cells} areas={polygon_area_summaries[:4]} "
+                f"bboxes={polygon_bbox_summaries[:4]}",
+                flush=True,
+            )
+            logged_slice_count += 1
+
+    filled_voxels = int(np.count_nonzero(output))
+    print(
+        f"[Build Model Mask] summary: active_slices={active_slice_count} "
+        f"slice_hits={total_slice_voxels} filled_voxels={filled_voxels}",
+        flush=True,
+    )
+
+    return output
 
 
 def clip_polygon_to_grid(polygon_points: np.ndarray, grid_definition: GridDefinition) -> np.ndarray:
@@ -1656,6 +1914,7 @@ def polydata_to_mask(
     shape: tuple[int, int, int],
     spacing: RenderSpacing,
     *,
+    origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
     dilate_steps: int = 1,
 ) -> np.ndarray:
     if polydata.GetNumberOfPoints() == 0 or polydata.GetNumberOfPolys() == 0:
@@ -1664,7 +1923,7 @@ def polydata_to_mask(
     image = vtk.vtkImageData()
     image.SetDimensions(*shape)
     image.SetSpacing(float(spacing.xline), float(spacing.inline), float(spacing.sample))
-    image.SetOrigin(0.0, 0.0, 0.0)
+    image.SetOrigin(float(origin[0]), float(origin[1]), float(origin[2]))
     image.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
     image.GetPointData().GetScalars().Fill(1)
 
@@ -1686,6 +1945,9 @@ def polydata_to_mask(
         numpy_support.vtk_to_numpy(image_stencil.GetOutput().GetPointData().GetScalars()),
         dtype=np.uint8,
     ).reshape(shape, order="F") > 0
+
+    if int(dilate_steps) <= 0:
+        return np.asarray(mask, dtype=bool)
 
     expanded = np.asarray(mask, dtype=bool)
     for _ in range(max(0, int(dilate_steps))):
@@ -2449,6 +2711,8 @@ class BuildModelWindow(QtWidgets.QDialog):
     load_elev_requested = QtCore.Signal()
     load_geomap_requested = QtCore.Signal()
     build_polygon_surface_requested = QtCore.Signal()
+    build_model_volume_requested = QtCore.Signal()
+    build_selected_model_mask_requested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2624,6 +2888,31 @@ class BuildModelWindow(QtWidgets.QDialog):
         surface_layout.addWidget(self.build_polygon_surface_button)
         layout.addWidget(self.surface_group)
 
+        self.volume_group = QtWidgets.QGroupBox("Build Volume")
+        volume_layout = QtWidgets.QVBoxLayout(self.volume_group)
+        volume_layout.setContentsMargins(8, 6, 8, 6)
+        volume_layout.setSpacing(6)
+        volume_form = QtWidgets.QFormLayout()
+        model_elev_row = QtWidgets.QHBoxLayout()
+        model_elev_row.setSpacing(6)
+        self.model_elev_path_edit = QtWidgets.QLineEdit()
+        model_elev_row.addWidget(self.model_elev_path_edit, stretch=1)
+        self.browse_model_elev_button = QtWidgets.QPushButton("Browse")
+        self.browse_model_elev_button.setMaximumWidth(72)
+        self.browse_model_elev_button.clicked.connect(self._browse_model_elev_path)
+        model_elev_row.addWidget(self.browse_model_elev_button)
+        volume_form.addRow("Elev File", model_elev_row)
+        self.model_output_name_edit = QtWidgets.QLineEdit()
+        volume_form.addRow("Output Name", self.model_output_name_edit)
+        volume_layout.addLayout(volume_form)
+        self.build_model_volume_button = QtWidgets.QPushButton("Build Model")
+        self.build_model_volume_button.clicked.connect(self.build_model_volume_requested.emit)
+        volume_layout.addWidget(self.build_model_volume_button)
+        self.build_selected_model_mask_button = QtWidgets.QPushButton("Build Selected Model Mask")
+        self.build_selected_model_mask_button.clicked.connect(self.build_selected_model_mask_requested.emit)
+        volume_layout.addWidget(self.build_selected_model_mask_button)
+        layout.addWidget(self.volume_group)
+
         self.close_button = QtWidgets.QPushButton("Close")
         self.close_button.clicked.connect(self.hide)
         layout.addWidget(self.close_button)
@@ -2643,11 +2932,13 @@ class BuildModelWindow(QtWidgets.QDialog):
         self.dip_path_edit.setText(str(self.settings.value("build_model/scatter/dip_path", "")))
         self.direction_path_edit.setText(str(self.settings.value("build_model/scatter/direction_path", "")))
         self.elev_path_edit.setText(str(self.settings.value("build_model/elev/path", "")))
+        self.model_elev_path_edit.setText(str(self.settings.value("build_model/elev/path", "")))
         self.geomap_path_edit.setText(str(self.settings.value("build_model/polygon/geomap_path", "")))
         self.geomap_elev_path_edit.setText(str(self.settings.value("build_model/polygon/elev_path", "")))
         self.surface_sample_count_edit.setText(str(self.settings.value("build_model/surface/sample_count", "160")))
         self.surface_layer_step_edit.setText(str(self.settings.value("build_model/surface/layer_step", "4")))
         self.surface_smooth_iterations_edit.setText(str(self.settings.value("build_model/surface/smooth_iterations", "2")))
+        self.model_output_name_edit.setText(str(self.settings.value("build_model/volume/output_name", "model_volume")))
 
     def save_grid_history(self, definition: GridDefinition) -> None:
         self.settings.setValue("build_model/grid/inline_start", definition.inline_start)
@@ -2666,6 +2957,8 @@ class BuildModelWindow(QtWidgets.QDialog):
 
     def save_elev_history(self, elev_path: str) -> None:
         self.settings.setValue("build_model/elev/path", elev_path)
+        self.elev_path_edit.setText(elev_path)
+        self.model_elev_path_edit.setText(elev_path)
 
     def save_geomap_history(self, geomap_path: str, elev_path: str) -> None:
         self.settings.setValue("build_model/polygon/geomap_path", geomap_path)
@@ -2681,6 +2974,9 @@ class BuildModelWindow(QtWidgets.QDialog):
         self.settings.setValue("build_model/surface/sample_count", int(sample_count))
         self.settings.setValue("build_model/surface/layer_step", float(layer_step))
         self.settings.setValue("build_model/surface/smooth_iterations", int(smooth_iterations))
+
+    def save_model_volume_history(self, output_name: str) -> None:
+        self.settings.setValue("build_model/volume/output_name", output_name)
 
     def current_grid_definition(self) -> GridDefinition | None:
         try:
@@ -2706,6 +3002,13 @@ class BuildModelWindow(QtWidgets.QDialog):
 
     def current_elev_path(self) -> str:
         return self.elev_path_edit.text().strip()
+
+    def current_model_elev_path(self) -> str:
+        path = self.model_elev_path_edit.text().strip()
+        return path or self.elev_path_edit.text().strip()
+
+    def current_model_output_name(self) -> str:
+        return self.model_output_name_edit.text().strip() or "model_volume"
 
     def current_surface_options(self) -> dict[str, float] | None:
         try:
@@ -2752,7 +3055,23 @@ class BuildModelWindow(QtWidgets.QDialog):
             "GMP Files (*.gmp);;Text Files (*.txt *.dat *.csv);;All Files (*)",
         )
         if path:
-            self.elev_path_edit.setText(path)
+            self.save_elev_history(path)
+
+    def _browse_model_elev_path(self) -> None:
+        start_dir = (
+            str(Path(self.model_elev_path_edit.text().strip()).expanduser().parent)
+            if self.model_elev_path_edit.text().strip()
+            else ""
+        )
+        if not start_dir and self.elev_path_edit.text().strip():
+            start_dir = str(Path(self.elev_path_edit.text().strip()).expanduser().parent)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Model Elev File",
+            start_dir,
+            "GMP Files (*.gmp);;Text Files (*.txt *.dat *.csv);;All Files (*)",
+        )
+        if path:
             self.save_elev_history(path)
 
     def _browse_geomap_path(self) -> None:
@@ -5015,6 +5334,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self.build_model_window.load_elev_requested.connect(self.open_load_elev_dialog)
             self.build_model_window.load_geomap_requested.connect(self.open_load_geomap_dialog)
             self.build_model_window.build_polygon_surface_requested.connect(self.open_build_polygon_surface_dialog)
+            self.build_model_window.build_model_volume_requested.connect(self.open_build_model_volume_dialog)
+            self.build_model_window.build_selected_model_mask_requested.connect(self.open_build_selected_model_mask_dialog)
         self.build_model_window.show()
         self.build_model_window.raise_()
         self.build_model_window.activateWindow()
@@ -5144,6 +5465,243 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.refresh_data_panel()
         self.schedule_render()
 
+    def open_build_model_volume_dialog(self) -> None:
+        if self.build_model_window is None:
+            self.open_build_model_window()
+        if self.build_model_window is None:
+            return
+        grid_definition = self.updater.grid_definition
+        if grid_definition is None:
+            QtWidgets.QMessageBox.information(self, "Missing Grid", "Please define grid before building model volume.")
+            return
+        if not self.updater.model_surfaces:
+            QtWidgets.QMessageBox.information(self, "Missing Model", "Please build model surfaces first.")
+            return
+
+        elev_path_text = self.build_model_window.current_model_elev_path()
+        if not elev_path_text:
+            QtWidgets.QMessageBox.information(self, "Missing Elev", "Please select an elev file first.")
+            return
+        output_name = self.build_model_window.current_model_output_name()
+        self.build_model_window.save_model_volume_history(output_name)
+
+        elev_path = Path(elev_path_text).expanduser().resolve()
+        print(f"[Build Model] start: output={output_name}", flush=True)
+        print(
+            "[Build Model] grid:"
+            f" inl={len(grid_definition.inline_values)}"
+            f" cxl={len(grid_definition.crossline_values)}"
+            f" samples={len(grid_definition.sample_values)}",
+            flush=True,
+        )
+        print(f"[Build Model] elev file: {elev_path}", flush=True)
+        try:
+            elev_inlines, elev_crosslines, elev_values = self._read_scatter_gmp(elev_path)
+            sample_size = max(1e-6, abs(float(grid_definition.sample_size)))
+            elev_surface = build_elev_surface(
+                elev_inlines,
+                elev_crosslines,
+                np.asarray(elev_values, dtype=np.float32) / np.float32(sample_size),
+            )
+        except ValueError as exc:
+            QtWidgets.QMessageBox.information(self, "Build Failed", str(exc))
+            return
+        print(
+            f"[Build Model] elev grid ready: rows={elev_values.size}, sample_size={sample_size}",
+            flush=True,
+        )
+
+        inline_values = grid_definition.inline_values
+        crossline_values = grid_definition.crossline_values
+        sample_values = grid_definition.sample_values
+        sample_min = float(np.min(sample_values))
+        sample_max = float(np.max(sample_values))
+
+        print("[Build Model] sampling elev over grid...", flush=True)
+        elev_depths = np.zeros((inline_values.size, crossline_values.size), dtype=np.float32)
+        for inline_index, inline_value in enumerate(inline_values):
+            for crossline_index, crossline_value in enumerate(crossline_values):
+                elev_depths[inline_index, crossline_index] = float(
+                    elev_surface.sample(float(inline_value), float(crossline_value))
+                )
+        print("[Build Model] elev sampling completed", flush=True)
+
+        sorted_models = sorted(
+            self.updater.model_surfaces.values(),
+            key=lambda dataset: float(np.mean(numpy_support.vtk_to_numpy(dataset.polydata.GetPoints().GetData())[:, 2])),
+            reverse=True,
+        )
+        model_masks: list[tuple[int, np.ndarray]] = []
+        total_models = len(sorted_models)
+        for index, model_surface in enumerate(sorted_models, start=1):
+            print(
+                f"[Build Model] rasterizing surface {index}/{total_models}: "
+                f"id={index} name={model_surface.name}",
+                flush=True,
+            )
+            model_mask = polydata_to_mask(
+                model_surface.polydata,
+                shape=(crossline_values.size, inline_values.size, sample_values.size),
+                spacing=self.updater.spacing,
+                origin=(
+                    float(grid_definition.crossline_start),
+                    float(grid_definition.inline_start),
+                    float(grid_definition.sample_start),
+                ),
+                dilate_steps=0,
+            )
+            print(
+                f"[Build Model] surface mask ready: id={index} voxels={int(np.count_nonzero(model_mask))}",
+                flush=True,
+            )
+            model_masks.append(
+                (
+                    index,
+                    model_mask,
+                )
+            )
+
+        print(f"[Build Model] filling volume with {len(sorted_models)} model surfaces...", flush=True)
+        volume_data_array = fill_model_volume_from_surfaces(
+            sample_values,
+            elev_depths,
+            model_masks,
+        )
+        print(
+            f"[Build Model] volume filled: shape={volume_data_array.shape}",
+            flush=True,
+        )
+        volume = VolumeData(
+            data=np.transpose(volume_data_array, (1, 0, 2)),
+            xlines=np.asarray(crossline_values, dtype=np.float32),
+            inlines=np.asarray(inline_values, dtype=np.float32),
+            samples=np.asarray(sample_values, dtype=np.float32),
+            name=output_name,
+            metadata={
+                "panel_category": "attribute",
+                "operation": "build_model_volume",
+                "source_elev_path": str(elev_path),
+                "source_model_count": len(sorted_models),
+            },
+        )
+        print("[Build Model] loading volume into attribute panel...", flush=True)
+        name = self.updater.add_attribute_volume(volume, name=output_name, opacity=0.9, select=True)
+        built_attribute = self.updater.attributes.get(name)
+        if built_attribute is not None:
+            built_attribute.image.SetSpacing(
+                float(grid_definition.crossline_size),
+                float(grid_definition.inline_size),
+                float(grid_definition.sample_size),
+            )
+            built_attribute.image.SetOrigin(
+                float(grid_definition.crossline_start),
+                float(grid_definition.inline_start),
+                float(grid_definition.sample_start),
+            )
+            print(
+                "[Build Model] image spacing aligned to grid:"
+                f" ({float(grid_definition.crossline_size)},"
+                f" {float(grid_definition.inline_size)},"
+                f" {float(grid_definition.sample_size)})",
+                flush=True,
+            )
+            print(
+                "[Build Model] image origin aligned to grid:"
+                f" ({float(grid_definition.crossline_start)},"
+                f" {float(grid_definition.inline_start)},"
+                f" {float(grid_definition.sample_start)})",
+                flush=True,
+            )
+        self.image = self.updater.image
+        self._selected_data_item = ("attribute", name)
+        print(f"[Build Model] completed: {name}", flush=True)
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        self.refresh_info()
+        self.refresh_data_panel()
+        self.schedule_render()
+
+    def open_build_selected_model_mask_dialog(self) -> None:
+        model_surface = self.updater.current_model_surface()
+        if model_surface is None:
+            QtWidgets.QMessageBox.information(self, "Missing Model", "Please select a model first.")
+            return
+        grid_definition = self.updater.grid_definition
+        if grid_definition is None:
+            QtWidgets.QMessageBox.information(self, "Missing Grid", "Please define grid before building model mask.")
+            return
+
+        inline_values = grid_definition.inline_values
+        crossline_values = grid_definition.crossline_values
+        sample_values = grid_definition.sample_values
+        output_name = f"{model_surface.name}_mask"
+        print(f"[Build Model Mask] start: model={model_surface.name}", flush=True)
+        print(
+            "[Build Model Mask] grid size:"
+            f" ({float(grid_definition.crossline_size)},"
+            f" {float(grid_definition.inline_size)},"
+            f" {float(grid_definition.sample_size)})",
+            flush=True,
+        )
+        mask_volume_array = build_model_mask_volume(
+            sample_values,
+            inline_values,
+            crossline_values,
+            model_surface.polydata,
+            debug_label=model_surface.name,
+        )
+        print(
+            f"[Build Model Mask] filled voxels={int(np.count_nonzero(mask_volume_array))}",
+            flush=True,
+        )
+        volume = VolumeData(
+            data=np.transpose(mask_volume_array, (1, 0, 2)),
+            xlines=np.asarray(crossline_values, dtype=np.float32),
+            inlines=np.asarray(inline_values, dtype=np.float32),
+            samples=np.asarray(sample_values, dtype=np.float32),
+            name=output_name,
+            metadata={
+                "panel_category": "attribute",
+                "operation": "build_model_mask",
+                "source_model_name": model_surface.name,
+            },
+        )
+        name = self.updater.add_attribute_volume(volume, name=output_name, opacity=0.9, select=True)
+        built_attribute = self.updater.attributes.get(name)
+        if built_attribute is not None:
+            built_attribute.image.SetSpacing(
+                float(grid_definition.crossline_size),
+                float(grid_definition.inline_size),
+                float(grid_definition.sample_size),
+            )
+            built_attribute.image.SetOrigin(
+                float(grid_definition.crossline_start),
+                float(grid_definition.inline_start),
+                float(grid_definition.sample_start),
+            )
+            print(
+                "[Build Model Mask] image spacing aligned to grid:"
+                f" ({float(grid_definition.crossline_size)},"
+                f" {float(grid_definition.inline_size)},"
+                f" {float(grid_definition.sample_size)})",
+                flush=True,
+            )
+            print(
+                "[Build Model Mask] image origin aligned to grid:"
+                f" ({float(grid_definition.crossline_start)},"
+                f" {float(grid_definition.inline_start)},"
+                f" {float(grid_definition.sample_start)})",
+                flush=True,
+            )
+        self.image = self.updater.image
+        self._selected_data_item = ("attribute", name)
+        print(f"[Build Model Mask] completed: {name}", flush=True)
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        self.refresh_info()
+        self.refresh_data_panel()
+        self.schedule_render()
+
     def open_load_elev_dialog(self) -> None:
         if self.build_model_window is None:
             self.open_build_model_window()
@@ -5240,17 +5798,10 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         if not polygons:
             QtWidgets.QMessageBox.information(self, "Load Failed", "No polygons were found in the geomap file.")
             return
-        current_grid = self.updater.grid_definition
-        grid_definition = default_geomap_grid_definition()
-        if current_grid is not None:
-            grid_definition.sample_start = current_grid.sample_start
-            grid_definition.sample_end = current_grid.sample_end
-            grid_definition.sample_size = current_grid.sample_size
-        self.build_model_window.save_grid_history(grid_definition)
-        self.updater.set_grid_definition(grid_definition, render=False)
-        self.image = self.updater.scene_image()
-        self.refresh_axis_controls()
-        self.refresh_scene_guides()
+        grid_definition = self.updater.grid_definition
+        if grid_definition is None:
+            QtWidgets.QMessageBox.information(self, "Missing Grid", "Please define grid before loading geomap.")
+            return
         elev_surface: ElevSurface | None = None
         sample_size = abs(float(grid_definition.sample_size))
         if geomap_elev_path_text:
@@ -5608,7 +6159,89 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             return
 
         if category == "polygon":
-            self.open_load_geomap_dialog()
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Load Polygon",
+                str(self._default_output_dir(category)),
+                "Wesi3D Polygon (*.npz);;Geomap GMP (*.gmp);;All Files (*)",
+            )
+            if not path:
+                return
+            selected_path = Path(path).expanduser().resolve()
+            if selected_path.suffix.lower() == ".npz":
+                payload = self._load_npz_payload(str(selected_path))
+                color_rgb = tuple(
+                    int(v)
+                    for v in np.asarray(
+                        payload.get("color_rgb", np.array([240, 210, 120], dtype=np.int32)),
+                        dtype=np.int32,
+                    ).ravel()[:3]
+                )
+                z_values = (
+                    np.asarray(payload["z_values"], dtype=np.float32)
+                    if "z_values" in payload
+                    else None
+                )
+                name = self.updater.add_polygon_data(
+                    str(self._payload_scalar(payload["name"])),
+                    color_rgb=color_rgb,
+                    grid_points=np.asarray(payload["grid_points"], dtype=np.float32),
+                    z_values=z_values,
+                    source_path=Path(str(self._payload_scalar(payload.get("source_path", np.array(str(selected_path)))))),
+                    select=True,
+                )
+                self._selected_data_item = ("polygon", name)
+                self.refresh_data_panel()
+                self.schedule_render()
+                return
+            polygons = load_geomap_polygons(selected_path)
+            if not polygons:
+                QtWidgets.QMessageBox.information(self, "Load Failed", "No polygons were found in the selected file.")
+                return
+            first_polygon_name: str | None = None
+            for index, (color_rgb, points) in enumerate(polygons, start=1):
+                polygon_name = self.updater.add_polygon_data(
+                    f"{selected_path.stem}_{index}",
+                    color_rgb=color_rgb,
+                    grid_points=points,
+                    z_values=np.zeros(points.shape[0], dtype=np.float32),
+                    source_path=selected_path,
+                    select=first_polygon_name is None,
+                )
+                if first_polygon_name is None:
+                    first_polygon_name = polygon_name
+            if first_polygon_name is not None:
+                self._selected_data_item = ("polygon", first_polygon_name)
+                self.refresh_data_panel()
+                self.schedule_render()
+            return
+
+        if category == "model":
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Load Model Surface",
+                str(self._default_output_dir(category)),
+                "NumPy Archive (*.npz)",
+            )
+            if not path:
+                return
+            payload = self._load_npz_payload(path)
+            polydata = polydata_from_payload(
+                np.asarray(payload["polydata_points"], dtype=np.float32),
+                np.asarray(payload["polydata_polys_offsets"], dtype=np.int64),
+                np.asarray(payload["polydata_polys_connectivity"], dtype=np.int64),
+            )
+            name = self.updater.add_model_surface(
+                str(self._payload_scalar(payload["name"])),
+                polydata=polydata,
+                source_polygon_name=str(self._payload_scalar(payload.get("source_polygon_name", np.array("")))),
+                dip_source_path=Path(str(self._payload_scalar(payload.get("dip_source_path", np.array(""))))),
+                direction_source_path=Path(str(self._payload_scalar(payload.get("direction_source_path", np.array(""))))),
+                select=True,
+            )
+            self._selected_data_item = ("model", name)
+            self.refresh_data_panel()
+            self.schedule_render()
             return
 
         QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据加载尚未实现。")
@@ -5723,14 +6356,25 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self,
                 "Store Polygon",
-                str(self._default_output_dir(category) / f"{name}.gmp"),
-                "Geomap GMP (*.gmp);;All Files (*)",
+                str(self._default_output_dir(category) / f"{name}.npz"),
+                "Wesi3D Polygon (*.npz);;Geomap GMP (*.gmp);;All Files (*)",
             )
             if path:
-                lines = ["Area", f"##{polygon.color_rgb[0]} {polygon.color_rgb[1]} {polygon.color_rgb[2]}"]
-                for point in np.asarray(polygon.grid_points, dtype=np.float32):
-                    lines.append(f"{float(point[0]):.3f} {float(point[1]):.3f}")
-                Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+                output_path = Path(path)
+                if output_path.suffix.lower() == ".gmp":
+                    lines = ["Area", f"##{polygon.color_rgb[0]} {polygon.color_rgb[1]} {polygon.color_rgb[2]}"]
+                    for point in np.asarray(polygon.grid_points, dtype=np.float32):
+                        lines.append(f"{float(point[0]):.3f} {float(point[1]):.3f}")
+                    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                else:
+                    np.savez_compressed(
+                        output_path,
+                        name=np.array(polygon.name),
+                        color_rgb=np.asarray(polygon.color_rgb, dtype=np.int32),
+                        grid_points=np.asarray(polygon.grid_points, dtype=np.float32),
+                        z_values=np.asarray(polygon.z_values, dtype=np.float32),
+                        source_path=np.array(str(polygon.source_path)),
+                    )
             return
 
         if category == "model":
