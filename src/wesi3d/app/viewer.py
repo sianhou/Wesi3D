@@ -899,6 +899,18 @@ class ColorMapControlWidget(QtWidgets.QGroupBox):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(6)
 
+        target_row = QtWidgets.QHBoxLayout()
+        target_row.setSpacing(6)
+        target_row.addWidget(QtWidgets.QLabel("Target"))
+        self.target_combo = QtWidgets.QComboBox()
+        self.target_combo.addItem("Attribute", "attribute")
+        self.target_combo.addItem("Control Point", "control_point")
+        target_row.addWidget(self.target_combo, stretch=1)
+        layout.addLayout(target_row)
+
+        self.control_point_use_colormap_checkbox = QtWidgets.QCheckBox("Use Value Colormap")
+        layout.addWidget(self.control_point_use_colormap_checkbox)
+
         preset_row = QtWidgets.QHBoxLayout()
         preset_row.setSpacing(6)
         preset_row.addWidget(QtWidgets.QLabel("Preset"))
@@ -953,6 +965,24 @@ class ColorMapControlWidget(QtWidgets.QGroupBox):
         self.min_edit.setEnabled(enabled)
         self.max_edit.setEnabled(enabled)
         self.apply_button.setEnabled(enabled)
+
+    def current_target(self) -> str:
+        return str(self.target_combo.currentData() or "attribute")
+
+    def set_target(self, target: str) -> None:
+        index = self.target_combo.findData(target)
+        if index < 0:
+            index = self.target_combo.findData("attribute")
+        self.target_combo.blockSignals(True)
+        if index >= 0:
+            self.target_combo.setCurrentIndex(index)
+        self.target_combo.blockSignals(False)
+
+    def set_target_enabled(self, enabled: bool) -> None:
+        self.target_combo.setEnabled(enabled)
+
+    def set_control_point_toggle_visible(self, visible: bool) -> None:
+        self.control_point_use_colormap_checkbox.setVisible(visible)
 
 
 class ExtractRangeDialog(QtWidgets.QDialog):
@@ -2704,10 +2734,14 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.replace_volume_button.clicked.connect(self.open_replace_volume_dialog)
         panel_layout.addWidget(self.replace_volume_button)
 
-        attribute_display_group = ColorMapControlWidget("Attribute Colormap")
+        attribute_display_group = ColorMapControlWidget("Colormap")
         self.attribute_colormap_widget = attribute_display_group
-        self.attribute_colormap_widget.apply_button.clicked.connect(self.apply_attribute_display)
-        self.attribute_colormap_widget.preset_combo.currentTextChanged.connect(self.change_attribute_colormap)
+        self.attribute_colormap_widget.target_combo.currentIndexChanged.connect(self.change_colormap_target)
+        self.attribute_colormap_widget.control_point_use_colormap_checkbox.toggled.connect(
+            self.toggle_control_point_colormap
+        )
+        self.attribute_colormap_widget.apply_button.clicked.connect(self.apply_active_colormap_range)
+        self.attribute_colormap_widget.preset_combo.currentTextChanged.connect(self.change_active_colormap)
         attribute_display_layout = attribute_display_group.layout()
 
         attribute_opacity_row = QtWidgets.QHBoxLayout()
@@ -2792,15 +2826,6 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         control_point_value_row.addWidget(self.copy_control_point_values_button)
         control_point_value_row.addStretch(1)
         control_point_tools_layout.addLayout(control_point_value_row)
-
-        self.control_point_use_colormap_checkbox = QtWidgets.QCheckBox("Use Value Colormap")
-        self.control_point_use_colormap_checkbox.toggled.connect(self.toggle_control_point_colormap)
-        control_point_tools_layout.addWidget(self.control_point_use_colormap_checkbox)
-
-        self.control_point_colormap_widget = ColorMapControlWidget("Control Point Colormap")
-        self.control_point_colormap_widget.apply_button.clicked.connect(self.apply_control_point_colormap_range)
-        self.control_point_colormap_widget.preset_combo.currentTextChanged.connect(self.change_control_point_colormap)
-        control_point_tools_layout.addWidget(self.control_point_colormap_widget)
 
         control_point_smooth_row = QtWidgets.QHBoxLayout()
         control_point_smooth_row.setSpacing(6)
@@ -2937,13 +2962,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
     def refresh_display_controls(self) -> None:
         attribute_range = self.updater.current_attribute_display_range()
         has_attribute = attribute_range is not None
-        self.attribute_colormap_widget.set_controls_enabled(has_attribute)
         self.attribute_opacity_slider.setEnabled(has_attribute)
-        if has_attribute:
-            self.attribute_colormap_widget.set_range(attribute_range)
-            self.attribute_colormap_widget.set_current_preset(self.updater.current_attribute_colormap_name())
-        else:
-            self.attribute_colormap_widget.set_range(None)
         self.attribute_opacity_slider.blockSignals(True)
         self.attribute_opacity_slider.setValue(int(round(self.updater.current_attribute_opacity() * 100.0)))
         self.attribute_opacity_slider.blockSignals(False)
@@ -2968,7 +2987,6 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.copy_control_point_values_button.setEnabled(bool(self.updater.attribute_names()) and any(
             horizon.control_point_set is not None for horizon in self.updater.horizons.values()
         ))
-        self.control_point_use_colormap_checkbox.setEnabled(has_control_points)
         self.control_point_smoothness_slider.setEnabled(has_control_points)
         has_selected_master = has_control_points and self._selected_master_point_index is not None
         self.move_master_up_button.setEnabled(has_selected_master)
@@ -2991,23 +3009,47 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             int(round((min_spacing if link_radius is None else link_radius) / max(min_spacing, 1e-6)))
         )
         self.control_point_link_radius_slider.blockSignals(False)
-        self.control_point_use_colormap_checkbox.blockSignals(True)
-        self.control_point_use_colormap_checkbox.setChecked(self.updater.current_control_point_use_attribute_colormap())
-        self.control_point_use_colormap_checkbox.blockSignals(False)
         colormap_range = self.updater.current_control_point_colormap_range()
         has_colormap_attribute = colormap_range is not None
-        self.control_point_colormap_widget.set_controls_enabled(has_control_points and has_colormap_attribute)
-        if colormap_range is not None:
-            self.control_point_colormap_widget.set_range(colormap_range)
-            self.control_point_colormap_widget.set_current_preset(self.updater.current_control_point_colormap_name())
-        else:
-            self.control_point_colormap_widget.set_range(None)
         smoothness = self.updater.current_control_point_rebuild_smoothness()
         self.control_point_smoothness_slider.blockSignals(True)
         self.control_point_smoothness_slider.setValue(
             int(round((0.55 if smoothness is None else smoothness) * 100.0))
         )
         self.control_point_smoothness_slider.blockSignals(False)
+
+        available_targets = []
+        if has_attribute:
+            available_targets.append("attribute")
+        if has_control_points:
+            available_targets.append("control_point")
+        active_target = self.attribute_colormap_widget.current_target()
+        if active_target not in available_targets:
+            fallback_target = available_targets[0] if available_targets else "attribute"
+            self.attribute_colormap_widget.set_target(fallback_target)
+            active_target = fallback_target
+        self.attribute_colormap_widget.set_target_enabled(len(available_targets) > 1)
+        show_control_point_toggle = active_target == "control_point"
+        self.attribute_colormap_widget.set_control_point_toggle_visible(show_control_point_toggle)
+        self.attribute_colormap_widget.control_point_use_colormap_checkbox.blockSignals(True)
+        self.attribute_colormap_widget.control_point_use_colormap_checkbox.setChecked(
+            self.updater.current_control_point_use_attribute_colormap()
+        )
+        self.attribute_colormap_widget.control_point_use_colormap_checkbox.blockSignals(False)
+        if active_target == "control_point":
+            self.attribute_colormap_widget.set_controls_enabled(has_control_points and has_colormap_attribute)
+            if colormap_range is not None:
+                self.attribute_colormap_widget.set_range(colormap_range)
+                self.attribute_colormap_widget.set_current_preset(self.updater.current_control_point_colormap_name())
+            else:
+                self.attribute_colormap_widget.set_range(None)
+        else:
+            self.attribute_colormap_widget.set_controls_enabled(has_attribute)
+            if has_attribute:
+                self.attribute_colormap_widget.set_range(attribute_range)
+                self.attribute_colormap_widget.set_current_preset(self.updater.current_attribute_colormap_name())
+            else:
+                self.attribute_colormap_widget.set_range(None)
 
         self.extract_button.setEnabled(has_attribute)
         self.extract_envelope_button.setEnabled(has_attribute)
@@ -3053,11 +3095,13 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
     def activate_data_item(self, category: str, name: str) -> None:
         self._selected_data_item = (category, name)
         if category in {"seismic", "attribute"}:
+            self.attribute_colormap_widget.set_target("attribute")
             self.updater.set_attribute(name, render=False)
             self.image = self.updater.image
             self.refresh_axis_controls()
             self.refresh_scene_guides()
         elif category == "horizon":
+            self.attribute_colormap_widget.set_target("control_point")
             self.updater.set_current_horizon(name, render=False)
             self._selected_master_point_index = None
             self._linked_master_point_indices.clear()
@@ -3920,30 +3964,12 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.refresh_data_panel()
         self.schedule_render()
 
+    def change_colormap_target(self) -> None:
+        self.refresh_display_controls()
+
     def toggle_control_point_colormap(self, checked: bool) -> None:
         self.updater.set_control_point_use_attribute_colormap(bool(checked), render=False)
         self._refresh_selected_master_actor()
-        self.refresh_display_controls()
-        self.schedule_render()
-
-    def apply_control_point_colormap_range(self) -> None:
-        min_text = self.control_point_colormap_widget.min_edit.text().strip()
-        max_text = self.control_point_colormap_widget.max_edit.text().strip()
-        if not min_text or not max_text:
-            return
-        try:
-            min_value = float(min_text)
-            max_value = float(max_text)
-        except ValueError:
-            return
-        self.updater.set_control_point_colormap_range(min_value, max_value, render=False)
-        self.refresh_display_controls()
-        self.schedule_render()
-
-    def change_control_point_colormap(self, name: str) -> None:
-        if not name:
-            return
-        self.updater.set_control_point_colormap(name, render=False)
         self.refresh_display_controls()
         self.schedule_render()
 
@@ -3967,7 +3993,7 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.refresh_display_controls()
         self.schedule_render()
 
-    def apply_attribute_display(self) -> None:
+    def apply_active_colormap_range(self) -> None:
         min_text = self.attribute_colormap_widget.min_edit.text().strip()
         max_text = self.attribute_colormap_widget.max_edit.text().strip()
         if not min_text or not max_text:
@@ -3977,13 +4003,20 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             max_value = float(max_text)
         except ValueError:
             return
-        self.updater.set_attribute_display_range(min_value, max_value, render=False)
+        if self.attribute_colormap_widget.current_target() == "control_point":
+            self.updater.set_control_point_colormap_range(min_value, max_value, render=False)
+            self.refresh_display_controls()
+        else:
+            self.updater.set_attribute_display_range(min_value, max_value, render=False)
         self.schedule_render()
 
-    def change_attribute_colormap(self, name: str) -> None:
+    def change_active_colormap(self, name: str) -> None:
         if not name:
             return
-        self.updater.set_attribute_colormap(name, render=False)
+        if self.attribute_colormap_widget.current_target() == "control_point":
+            self.updater.set_control_point_colormap(name, render=False)
+        else:
+            self.updater.set_attribute_colormap(name, render=False)
         self.refresh_display_controls()
         self.schedule_render()
 
