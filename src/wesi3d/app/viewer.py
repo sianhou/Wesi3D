@@ -155,6 +155,18 @@ class ScatterDataSet:
 
 
 @dataclass
+class PolygonDataSet:
+    name: str
+    actor: vtk.vtkActor
+    polydata: vtk.vtkPolyData
+    mapper: vtk.vtkPolyDataMapper
+    color_rgb: tuple[int, int, int]
+    rw_points: np.ndarray
+    source_path: Path
+    visible: bool = True
+
+
+@dataclass
 class GridDefinition:
     inline_start: float
     inline_end: float
@@ -191,6 +203,70 @@ class GridDefinition:
     @property
     def sample_values(self) -> np.ndarray:
         return self._axis_values(self.sample_start, self.sample_end, self.sample_size)
+
+
+GEOMAP_POINT0 = (517888.79, 4598260.61, 2000.0, 1200.0)
+GEOMAP_POINT1 = (501208.58, 4636806.30, 2000.0, 3300.0)
+GEOMAP_POINT3 = (554598.98, 4614146.52, 4000.0, 1200.0)
+
+
+def _geomap_vec(start_xy: tuple[float, float], end_xy: tuple[float, float]) -> tuple[float, float]:
+    return (float(end_xy[0]) - float(start_xy[0]), float(end_xy[1]) - float(start_xy[1]))
+
+
+def _geomap_dot(left: tuple[float, float], right: tuple[float, float]) -> float:
+    return float(left[0] * right[0] + left[1] * right[1])
+
+
+def _geomap_norm(vec: tuple[float, float]) -> float:
+    return float(np.hypot(vec[0], vec[1]))
+
+
+def default_geomap_grid_parameters() -> dict[str, object]:
+    point0_xy = (GEOMAP_POINT0[0], GEOMAP_POINT0[1])
+    point1_xy = (GEOMAP_POINT1[0], GEOMAP_POINT1[1])
+    point3_xy = (GEOMAP_POINT3[0], GEOMAP_POINT3[1])
+    vec_inl = _geomap_vec(point0_xy, point3_xy)
+    vec_cxl = _geomap_vec(point0_xy, point1_xy)
+    len_inl = _geomap_norm(vec_inl)
+    len_cxl = _geomap_norm(vec_cxl)
+    span_inl = GEOMAP_POINT3[2] - GEOMAP_POINT0[2]
+    span_cxl = GEOMAP_POINT1[3] - GEOMAP_POINT0[3]
+    inl_unit = (vec_inl[0] / len_inl, vec_inl[1] / len_inl)
+    cxl_unit = (vec_cxl[0] / len_cxl, vec_cxl[1] / len_cxl)
+    return {
+        "point0_xy": point0_xy,
+        "point0_inl": GEOMAP_POINT0[2],
+        "point0_cxl": GEOMAP_POINT0[3],
+        "step_inl": len_inl / abs(span_inl),
+        "step_cxl": len_cxl / abs(span_cxl),
+        "inl_unit": inl_unit,
+        "cxl_unit": cxl_unit,
+    }
+
+
+def geomap_grid_from_rw(rw_x: float, rw_y: float) -> tuple[float, float]:
+    grid = default_geomap_grid_parameters()
+    rel = _geomap_vec(grid["point0_xy"], (float(rw_x), float(rw_y)))
+    dist_inl = _geomap_dot(rel, grid["inl_unit"])
+    dist_cxl = _geomap_dot(rel, grid["cxl_unit"])
+    inl = float(grid["point0_inl"]) + dist_inl / float(grid["step_inl"])
+    cxl = float(grid["point0_cxl"]) + dist_cxl / float(grid["step_cxl"])
+    return float(inl), float(cxl)
+
+
+def default_geomap_grid_definition() -> GridDefinition:
+    return GridDefinition(
+        inline_start=min(GEOMAP_POINT0[2], GEOMAP_POINT3[2]),
+        inline_end=max(GEOMAP_POINT0[2], GEOMAP_POINT3[2]),
+        crossline_start=min(GEOMAP_POINT0[3], GEOMAP_POINT1[3]),
+        crossline_end=max(GEOMAP_POINT0[3], GEOMAP_POINT1[3]),
+        sample_start=0.0,
+        sample_end=1.0,
+        inline_size=100.0,
+        crossline_size=100.0,
+        sample_size=1.0,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -529,6 +605,100 @@ def create_scatter_actor(
     actor.GetProperty().SetPointSize(6.0)
     actor.GetProperty().SetOpacity(0.95)
     return actor, polydata, mapper, lut, value_range
+
+
+def load_geomap_polygons(path: Path) -> list[tuple[tuple[int, int, int], np.ndarray]]:
+    polygons: list[tuple[tuple[int, int, int], np.ndarray]] = []
+    current_points: list[tuple[float, float]] = []
+    current_color = (240, 210, 120)
+    with path.open("r", encoding="utf-8") as handle:
+        for line_index, raw_line in enumerate(handle):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line_index == 0:
+                continue
+            if line.startswith("##"):
+                if len(current_points) >= 2:
+                    polygons.append((current_color, np.asarray(current_points, dtype=np.float32)))
+                current_points = []
+                color_parts = line[2:].strip().split()
+                if len(color_parts) >= 3:
+                    try:
+                        current_color = tuple(int(max(0, min(255, int(part)))) for part in color_parts[:3])  # type: ignore[assignment]
+                    except ValueError:
+                        current_color = (240, 210, 120)
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                current_points.append((float(parts[0]), float(parts[1])))
+            except ValueError:
+                continue
+    if len(current_points) >= 2:
+        polygons.append((current_color, np.asarray(current_points, dtype=np.float32)))
+    return polygons
+
+
+def polygon_intersects_grid(polygon_rw: np.ndarray, grid_definition: GridDefinition) -> bool:
+    inline_min = min(float(grid_definition.inline_start), float(grid_definition.inline_end))
+    inline_max = max(float(grid_definition.inline_start), float(grid_definition.inline_end))
+    crossline_min = min(float(grid_definition.crossline_start), float(grid_definition.crossline_end))
+    crossline_max = max(float(grid_definition.crossline_start), float(grid_definition.crossline_end))
+    for rw_point in np.asarray(polygon_rw, dtype=np.float32):
+        inl, cxl = geomap_grid_from_rw(float(rw_point[0]), float(rw_point[1]))
+        if inline_min <= inl <= inline_max and crossline_min <= cxl <= crossline_max:
+            return True
+    return False
+
+
+def normalize_polygon_rw_points(polygon_rw: np.ndarray) -> np.ndarray:
+    points = np.asarray(polygon_rw, dtype=np.float32)
+    if points.shape[0] >= 2 and np.allclose(points[0], points[-1]):
+        return np.asarray(points[:-1], dtype=np.float32)
+    return points
+
+
+def create_polygon_actor(
+    color_rgb: tuple[int, int, int],
+    polygon_rw: np.ndarray,
+) -> tuple[vtk.vtkActor, vtk.vtkPolyData, vtk.vtkPolyDataMapper]:
+    polygon_rw = normalize_polygon_rw_points(polygon_rw)
+    points = vtk.vtkPoints()
+    lines = vtk.vtkCellArray()
+    colors = vtk.vtkUnsignedCharArray()
+    colors.SetName("color")
+    colors.SetNumberOfComponents(3)
+
+    if polygon_rw.shape[0] < 2:
+        polygon_rw = np.asarray([[0.0, 0.0], [0.0, 0.0]], dtype=np.float32)
+    line = vtk.vtkPolyLine()
+    line.GetPointIds().SetNumberOfIds(polygon_rw.shape[0] + 1)
+    for index, rw_point in enumerate(polygon_rw):
+        inl, cxl = geomap_grid_from_rw(float(rw_point[0]), float(rw_point[1]))
+        point_id = points.InsertNextPoint(float(cxl), float(inl), 0.0)
+        line.GetPointIds().SetId(index, point_id)
+    line.GetPointIds().SetId(polygon_rw.shape[0], line.GetPointIds().GetId(0))
+    lines.InsertNextCell(line)
+    colors.InsertNextTuple3(*color_rgb)
+
+    polydata = vtk.vtkPolyData()
+    polydata.SetPoints(points)
+    polydata.SetLines(lines)
+    polydata.GetCellData().SetScalars(colors)
+
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputData(polydata)
+    mapper.SetScalarModeToUseCellData()
+    mapper.SetColorModeToDirectScalars()
+    mapper.ScalarVisibilityOn()
+
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetLineWidth(2.0)
+    actor.GetProperty().SetOpacity(0.95)
+    return actor, polydata, mapper
 
 
 def create_grid_image(definition: GridDefinition) -> vtk.vtkImageData:
@@ -1695,6 +1865,7 @@ class LoadSeismicDialog(QtWidgets.QDialog):
 class BuildModelWindow(QtWidgets.QDialog):
     define_grid_requested = QtCore.Signal()
     load_dip_direction_requested = QtCore.Signal()
+    load_geomap_requested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1794,7 +1965,25 @@ class BuildModelWindow(QtWidgets.QDialog):
         self.load_dip_direction_button = QtWidgets.QPushButton("Load Dip/Direction")
         self.load_dip_direction_button.clicked.connect(self.load_dip_direction_requested.emit)
         scatter_layout.addWidget(self.load_dip_direction_button)
-        layout.addWidget(self.scatter_group, stretch=1)
+        layout.addWidget(self.scatter_group)
+
+        self.geomap_group = QtWidgets.QGroupBox("Load Geomap")
+        geomap_layout = QtWidgets.QVBoxLayout(self.geomap_group)
+        geomap_layout.setContentsMargins(8, 6, 8, 6)
+        geomap_layout.setSpacing(6)
+        geomap_row = QtWidgets.QHBoxLayout()
+        geomap_row.setSpacing(6)
+        self.geomap_path_edit = QtWidgets.QLineEdit()
+        geomap_row.addWidget(self.geomap_path_edit, stretch=1)
+        self.browse_geomap_button = QtWidgets.QPushButton("Browse")
+        self.browse_geomap_button.setMaximumWidth(72)
+        self.browse_geomap_button.clicked.connect(self._browse_geomap_path)
+        geomap_row.addWidget(self.browse_geomap_button)
+        geomap_layout.addLayout(geomap_row)
+        self.load_geomap_button = QtWidgets.QPushButton("Load Geomap")
+        self.load_geomap_button.clicked.connect(self.load_geomap_requested.emit)
+        geomap_layout.addWidget(self.load_geomap_button)
+        layout.addWidget(self.geomap_group, stretch=1)
 
         self.close_button = QtWidgets.QPushButton("Close")
         self.close_button.clicked.connect(self.hide)
@@ -1814,6 +2003,7 @@ class BuildModelWindow(QtWidgets.QDialog):
         self.sample_size_edit.setText(str(self.settings.value("build_model/grid/sample_size", "10")))
         self.dip_path_edit.setText(str(self.settings.value("build_model/scatter/dip_path", "")))
         self.direction_path_edit.setText(str(self.settings.value("build_model/scatter/direction_path", "")))
+        self.geomap_path_edit.setText(str(self.settings.value("build_model/polygon/geomap_path", "")))
 
     def save_grid_history(self, definition: GridDefinition) -> None:
         self.settings.setValue("build_model/grid/inline_start", definition.inline_start)
@@ -1829,6 +2019,9 @@ class BuildModelWindow(QtWidgets.QDialog):
     def save_scatter_history(self, dip_path: str, direction_path: str) -> None:
         self.settings.setValue("build_model/scatter/dip_path", dip_path)
         self.settings.setValue("build_model/scatter/direction_path", direction_path)
+
+    def save_geomap_history(self, geomap_path: str) -> None:
+        self.settings.setValue("build_model/polygon/geomap_path", geomap_path)
 
     def current_grid_definition(self) -> GridDefinition | None:
         try:
@@ -1848,6 +2041,9 @@ class BuildModelWindow(QtWidgets.QDialog):
 
     def current_scatter_paths(self) -> tuple[str, str]:
         return self.dip_path_edit.text().strip(), self.direction_path_edit.text().strip()
+
+    def current_geomap_path(self) -> str:
+        return self.geomap_path_edit.text().strip()
 
     def _browse_dip_path(self) -> None:
         start_dir = str(Path(self.dip_path_edit.text().strip()).expanduser().parent) if self.dip_path_edit.text().strip() else ""
@@ -1874,6 +2070,18 @@ class BuildModelWindow(QtWidgets.QDialog):
         if path:
             self.direction_path_edit.setText(path)
             self.save_scatter_history(self.dip_path_edit.text().strip(), path)
+
+    def _browse_geomap_path(self) -> None:
+        start_dir = str(Path(self.geomap_path_edit.text().strip()).expanduser().parent) if self.geomap_path_edit.text().strip() else ""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Geomap File",
+            start_dir,
+            "GMP Files (*.gmp);;Text Files (*.txt *.dat *.csv);;All Files (*)",
+        )
+        if path:
+            self.geomap_path_edit.setText(path)
+            self.save_geomap_history(path)
 
 
 class DefineGridDialog(QtWidgets.QDialog):
@@ -1972,12 +2180,14 @@ class SliceUpdater:
         self.attributes: dict[str, AttributeVolume] = {}
         self.horizons: dict[str, HorizonSurface] = {}
         self.scatter_sets: dict[str, ScatterDataSet] = {}
+        self.polygon_sets: dict[str, PolygonDataSet] = {}
         self.grid_definition: GridDefinition | None = None
         self.grid_image: vtk.vtkImageData | None = None
         self.grid_actor: vtk.vtkActor | None = None
         self.current_horizon_name: str | None = None
         self.current_attribute_name: str | None = None
         self.current_scatter_name: str | None = None
+        self.current_polygon_name: str | None = None
         self.last_rebuild_error: str | None = None
         self.image = bundles["xline"].image
         self.xlines = np.asarray([0.0], dtype=np.float32)
@@ -2081,6 +2291,9 @@ class SliceUpdater:
     def scatter_names(self) -> list[str]:
         return list(self.scatter_sets.keys())
 
+    def polygon_names(self) -> list[str]:
+        return list(self.polygon_sets.keys())
+
     def current_attribute_opacity(self) -> float:
         attribute = self.current_attribute()
         if attribute is None:
@@ -2105,6 +2318,11 @@ class SliceUpdater:
             return None
         return self.scatter_sets.get(self.current_scatter_name)
 
+    def current_polygon(self) -> PolygonDataSet | None:
+        if self.current_polygon_name is None:
+            return None
+        return self.polygon_sets.get(self.current_polygon_name)
+
     def set_index(self, orientation: str, index: int, render: bool = True) -> None:
         if not self.has_attribute_data():
             return
@@ -2124,6 +2342,7 @@ class SliceUpdater:
         if name not in self.attributes:
             raise KeyError(f"Unknown attribute: {name}")
         self.set_current_scatter(None, render=False)
+        self.set_current_polygon(None, render=False)
         attr = self.attributes[name]
         self.current_attribute_name = name
         self.image = attr.image
@@ -2279,6 +2498,7 @@ class SliceUpdater:
 
     def set_current_horizon(self, name: str | None, render: bool = True) -> None:
         self.set_current_scatter(None, render=False)
+        self.set_current_polygon(None, render=False)
         self.current_horizon_name = name
         for horizon_name, horizon in self.horizons.items():
             prop = horizon.actor.GetProperty()
@@ -2318,6 +2538,17 @@ class SliceUpdater:
             scatter.actor.GetProperty().SetPointSize(8.0 if is_current else 6.0)
             scatter.actor.GetProperty().SetOpacity((1.0 if is_current else 0.82) if scatter.visible else 0.0)
             scatter.actor.SetVisibility(scatter.visible)
+        self.refresh_scalar_bar()
+        if render:
+            self.interactor.GetRenderWindow().Render()
+
+    def set_current_polygon(self, name: str | None, render: bool = True) -> None:
+        self.current_polygon_name = name if name in self.polygon_sets else None
+        for polygon_name, polygon in self.polygon_sets.items():
+            is_current = polygon_name == self.current_polygon_name
+            polygon.actor.GetProperty().SetLineWidth(3.2 if is_current else 2.0)
+            polygon.actor.GetProperty().SetOpacity((1.0 if is_current else 0.90) if polygon.visible else 0.0)
+            polygon.actor.SetVisibility(polygon.visible)
         self.refresh_scalar_bar()
         if render:
             self.interactor.GetRenderWindow().Render()
@@ -2662,10 +2893,33 @@ class SliceUpdater:
         self.set_current_scatter(new_name if select else self.current_scatter_name, render=False)
         return new_name
 
+    def add_polygon_data(
+        self,
+        name: str,
+        *,
+        color_rgb: tuple[int, int, int],
+        rw_points: np.ndarray,
+        source_path: Path,
+        select: bool = False,
+    ) -> str:
+        actor, polydata, mapper = create_polygon_actor(color_rgb, rw_points)
+        new_name = self._unique_name(self.polygon_sets, name)
+        dataset = PolygonDataSet(
+            name=new_name,
+            actor=actor,
+            polydata=polydata,
+            mapper=mapper,
+            color_rgb=tuple(int(v) for v in color_rgb),
+            rw_points=np.asarray(rw_points, dtype=np.float32),
+            source_path=Path(source_path),
+            visible=True,
+        )
+        self.polygon_sets[new_name] = dataset
+        self.renderer.AddActor(actor)
+        self.set_current_polygon(new_name if select else self.current_polygon_name, render=False)
+        return new_name
+
     def set_grid_definition(self, definition: GridDefinition, render: bool = True) -> None:
-        crossline_values = definition.crossline_values
-        inline_values = definition.inline_values
-        sample_values = definition.sample_values
         self.grid_definition = definition
         self.spacing = RenderSpacing(
             xline=float(definition.crossline_size),
@@ -2864,6 +3118,15 @@ class SliceUpdater:
         self.renderer.RemoveActor(scatter.actor)
         if self.current_scatter_name == name:
             self.set_current_scatter(next(iter(self.scatter_sets), None), render=False)
+        return True
+
+    def remove_polygon(self, name: str) -> bool:
+        polygon = self.polygon_sets.pop(name, None)
+        if polygon is None:
+            return False
+        self.renderer.RemoveActor(polygon.actor)
+        if self.current_polygon_name == name:
+            self.set_current_polygon(next(iter(self.polygon_sets), None), render=False)
         return True
 
     def current_control_point_display_scale(self) -> float | None:
@@ -3167,8 +3430,11 @@ class SliceUpdater:
         lut: vtk.vtkLookupTable | None = None
         title = ""
         scatter = self.current_scatter()
+        polygon = self.current_polygon()
         point_set = self.current_control_point_set()
-        if scatter is not None:
+        if polygon is not None:
+            lut = None
+        elif scatter is not None:
             lut = scatter.lut
             title = f"Scatter\n{scatter.name}"
         elif (
@@ -3646,6 +3912,14 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                 )
                 for name in self.updater.scatter_names()
             ],
+            "polygon": [
+                DataPanelItem(
+                    category="polygon",
+                    name=name,
+                    label=f"{name} ({len(self.updater.polygon_sets[name].rw_points)} pts)",
+                )
+                for name in self.updater.polygon_names()
+            ],
             "well": [],
         }
         self.data_panel.set_items(items)
@@ -3670,6 +3944,10 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self._refresh_selected_master_actor()
         elif category == "scatter":
             self.updater.set_current_scatter(name, render=False)
+            self.updater.set_current_polygon(None, render=False)
+        elif category == "polygon":
+            self.updater.set_current_scatter(None, render=False)
+            self.updater.set_current_polygon(name, render=False)
         self.refresh_info()
         self.refresh_data_panel()
         self.schedule_render()
@@ -3907,11 +4185,14 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self.build_model_window = BuildModelWindow(self)
             self.build_model_window.define_grid_requested.connect(self.open_define_grid_dialog)
             self.build_model_window.load_dip_direction_requested.connect(self.open_load_dip_direction_dialog)
+            self.build_model_window.load_geomap_requested.connect(self.open_load_geomap_dialog)
         self.build_model_window.show()
         self.build_model_window.raise_()
         self.build_model_window.activateWindow()
 
     def open_define_grid_dialog(self) -> None:
+        if self.build_model_window is None:
+            self.open_build_model_window()
         if self.build_model_window is None:
             return
         definition = self.build_model_window.current_grid_definition()
@@ -3943,6 +4224,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
 
     def open_load_dip_direction_dialog(self) -> None:
         if self.build_model_window is None:
+            self.open_build_model_window()
+        if self.build_model_window is None:
             return
         dip_path_text, direction_path_text = self.build_model_window.current_scatter_paths()
         if not dip_path_text or not direction_path_text:
@@ -3973,6 +4256,69 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             select=False,
         )
         self._selected_data_item = ("scatter", dip_name)
+        self.refresh_data_panel()
+        self.schedule_render()
+
+    def open_load_geomap_dialog(self) -> None:
+        if self.build_model_window is None:
+            self.open_build_model_window()
+        if self.build_model_window is None:
+            return
+        geomap_path_text = self.build_model_window.current_geomap_path()
+        if not geomap_path_text:
+            QtWidgets.QMessageBox.information(self, "Missing File", "Please select a geomap file.")
+            return
+        self.build_model_window.save_geomap_history(geomap_path_text)
+        geomap_path = Path(geomap_path_text).expanduser().resolve()
+        if not geomap_path.exists():
+            QtWidgets.QMessageBox.information(self, "Missing File", f"Geomap file not found:\n{geomap_path}")
+            return
+        polygons = load_geomap_polygons(geomap_path)
+        if not polygons:
+            QtWidgets.QMessageBox.information(self, "Load Failed", "No polygons were found in the geomap file.")
+            return
+        current_grid = self.updater.grid_definition
+        grid_definition = default_geomap_grid_definition()
+        if current_grid is not None:
+            grid_definition.sample_start = current_grid.sample_start
+            grid_definition.sample_end = current_grid.sample_end
+            grid_definition.sample_size = current_grid.sample_size
+        self.build_model_window.save_grid_history(grid_definition)
+        self.updater.set_grid_definition(grid_definition, render=False)
+        self.image = self.updater.scene_image()
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        filtered_polygons = [
+            (color_rgb, normalize_polygon_rw_points(rw_points))
+            for color_rgb, rw_points in polygons
+            if polygon_intersects_grid(rw_points, grid_definition)
+        ]
+        if not filtered_polygons:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Load Failed",
+                "No polygons have any point inside the current grid range.",
+            )
+            self.refresh_data_panel()
+            self.schedule_render()
+            return
+        first_polygon_name: str | None = None
+        for index, (color_rgb, rw_points) in enumerate(filtered_polygons, start=1):
+            polygon_name = self.updater.add_polygon_data(
+                f"{geomap_path.stem}_{index}",
+                color_rgb=color_rgb,
+                rw_points=rw_points,
+                source_path=geomap_path,
+                select=first_polygon_name is None,
+            )
+            if first_polygon_name is None:
+                first_polygon_name = polygon_name
+        if first_polygon_name is None:
+            QtWidgets.QMessageBox.information(self, "Load Failed", "No valid polygons were created from the geomap file.")
+            return
+        self._selected_data_item = ("polygon", first_polygon_name)
+        configure_default_camera(self.renderer, self.updater.scene_image())
+        self.refresh_info()
         self.refresh_data_panel()
         self.schedule_render()
 
@@ -4277,6 +4623,10 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             self.open_load_dip_direction_dialog()
             return
 
+        if category == "polygon":
+            self.open_load_geomap_dialog()
+            return
+
         QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据加载尚未实现。")
 
     def store_data_item(self, category: str, name: str) -> None:
@@ -4383,6 +4733,21 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
                 )
             return
 
+        if category == "polygon":
+            polygon = self.updater.polygon_sets[name]
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Store Polygon",
+                str(self._default_output_dir(category) / f"{name}.gmp"),
+                "Geomap GMP (*.gmp);;All Files (*)",
+            )
+            if path:
+                lines = ["Area", f"##{polygon.color_rgb[0]} {polygon.color_rgb[1]} {polygon.color_rgb[2]}"]
+                for point in np.asarray(polygon.rw_points, dtype=np.float32):
+                    lines.append(f"{float(point[0]):.3f} {float(point[1]):.3f}")
+                Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return
+
         QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据存储尚未实现。")
 
     def unload_data_item(self, category: str, name: str) -> None:
@@ -4394,6 +4759,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             removed = self.updater.remove_horizon(name)
         elif category == "scatter":
             removed = self.updater.remove_scatter(name)
+        elif category == "polygon":
+            removed = self.updater.remove_polygon(name)
         else:
             QtWidgets.QMessageBox.information(self, "Not Implemented", "井数据卸载尚未实现。")
             return
@@ -4406,17 +4773,21 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         if current_scatter is not None:
             self._selected_data_item = ("scatter", current_scatter.name)
         else:
-            current_attribute = self.updater.current_attribute()
-            if current_attribute is not None and self.updater.current_attribute_name is not None:
-                fallback_category = str(
-                    current_attribute.volume_data.metadata.get(
-                        "panel_category",
-                        "seismic" if self.updater.current_attribute_name == "seismic" else "attribute",
-                    )
-                )
-                self._selected_data_item = (fallback_category, self.updater.current_attribute_name)
+            current_polygon = self.updater.current_polygon()
+            if current_polygon is not None:
+                self._selected_data_item = ("polygon", current_polygon.name)
             else:
-                self._selected_data_item = None
+                current_attribute = self.updater.current_attribute()
+                if current_attribute is not None and self.updater.current_attribute_name is not None:
+                    fallback_category = str(
+                        current_attribute.volume_data.metadata.get(
+                            "panel_category",
+                            "seismic" if self.updater.current_attribute_name == "seismic" else "attribute",
+                        )
+                    )
+                    self._selected_data_item = (fallback_category, self.updater.current_attribute_name)
+                else:
+                    self._selected_data_item = None
         self.refresh_axis_controls()
         self.refresh_scene_guides()
         self.refresh_info()

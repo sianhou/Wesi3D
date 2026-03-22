@@ -18,12 +18,13 @@ class DataPanelWidget(QtWidgets.QWidget):
     item_store_requested = QtCore.Signal(str, str)
     item_unload_requested = QtCore.Signal(str, str)
 
-    CATEGORY_ORDER = ("seismic", "attribute", "horizon", "scatter", "well")
+    CATEGORY_ORDER = ("seismic", "attribute", "horizon", "scatter", "polygon", "well")
     CATEGORY_LABELS = {
         "seismic": "地震",
         "attribute": "属性",
         "horizon": "层位",
         "scatter": "散点",
+        "polygon": "多边形",
         "well": "井",
     }
 
