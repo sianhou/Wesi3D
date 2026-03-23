@@ -55,7 +55,7 @@ from ..data.attribute_data import (
     load_attribute_from_volume,
 )
 from ..data.volume_data import load_segy_geometry, read_segy_volume
-from .data_panel import DataPanelItem, DataPanelWidget
+from .data_panel import DataPanelItem, DataPanelWidget, ProjectPanelWidget
 from ..processing.control_points import (
     ControlPoint,
     MasterMove,
@@ -194,6 +194,10 @@ class GridDefinition:
     inline_size: float
     crossline_size: float
     sample_size: float
+    datum: float = 0.0
+    inline_step: float | None = None
+    crossline_step: float | None = None
+    sample_step: float | None = None
 
     @staticmethod
     def _axis_values(start: float, end: float, step_size: float) -> np.ndarray:
@@ -211,15 +215,79 @@ class GridDefinition:
 
     @property
     def inline_values(self) -> np.ndarray:
-        return self._axis_values(self.inline_start, self.inline_end, self.inline_size)
+        return self._axis_values(
+            self.inline_start,
+            self.inline_end,
+            self.inline_size if self.inline_step is None else self.inline_step,
+        )
 
     @property
     def crossline_values(self) -> np.ndarray:
-        return self._axis_values(self.crossline_start, self.crossline_end, self.crossline_size)
+        return self._axis_values(
+            self.crossline_start,
+            self.crossline_end,
+            self.crossline_size if self.crossline_step is None else self.crossline_step,
+        )
 
     @property
     def sample_values(self) -> np.ndarray:
-        return self._axis_values(self.sample_start, self.sample_end, self.sample_size)
+        return self._axis_values(
+            self.sample_start,
+            self.sample_end,
+            self.sample_size if self.sample_step is None else self.sample_step,
+        )
+
+    @property
+    def inline_display_spacing(self) -> float:
+        return float((self.inline_step if self.inline_step is not None else 1.0) * self.inline_size)
+
+    @property
+    def crossline_display_spacing(self) -> float:
+        return float((self.crossline_step if self.crossline_step is not None else 1.0) * self.crossline_size)
+
+    @property
+    def sample_display_spacing(self) -> float:
+        return float((self.sample_step if self.sample_step is not None else 1.0) * self.sample_size)
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "inline_start": float(self.inline_start),
+            "inline_end": float(self.inline_end),
+            "crossline_start": float(self.crossline_start),
+            "crossline_end": float(self.crossline_end),
+            "sample_start": float(self.sample_start),
+            "sample_end": float(self.sample_end),
+            "inline_size": float(self.inline_size),
+            "crossline_size": float(self.crossline_size),
+            "sample_size": float(self.sample_size),
+            "datum": float(self.datum),
+            "inline_step": float(self.inline_size if self.inline_step is None else self.inline_step),
+            "crossline_step": float(self.crossline_size if self.crossline_step is None else self.crossline_step),
+            "sample_step": float(self.sample_size if self.sample_step is None else self.sample_step),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> GridDefinition:
+        return cls(
+            inline_start=float(payload["inline_start"]),
+            inline_end=float(payload["inline_end"]),
+            crossline_start=float(payload["crossline_start"]),
+            crossline_end=float(payload["crossline_end"]),
+            sample_start=float(payload["sample_start"]),
+            sample_end=float(payload["sample_end"]),
+            inline_size=float(payload["inline_size"]),
+            crossline_size=float(payload["crossline_size"]),
+            sample_size=float(payload["sample_size"]),
+            datum=float(payload.get("datum", 0.0)),
+            inline_step=float(payload.get("inline_step", payload["inline_size"])),
+            crossline_step=float(payload.get("crossline_step", payload["crossline_size"])),
+            sample_step=float(payload.get("sample_step", payload["sample_size"])),
+        )
+
+    def to_json_file(self, path: str | Path) -> Path:
+        target = Path(path)
+        target.write_text(json.dumps(self.as_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+        return target
 
 
 GEOMAP_POINT0 = (517888.79, 4598260.61, 2000.0, 1200.0)
@@ -3175,6 +3243,249 @@ class DefineGridDialog(QtWidgets.QDialog):
             return None
 
 
+class NewProjectDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("New Project")
+        self.setModal(True)
+        self.settings = QtCore.QSettings("wesi3d", APP_NAME)
+        self.last_error: str | None = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+
+        self.project_name_edit = QtWidgets.QLineEdit()
+        form.addRow("Project Name", self.project_name_edit)
+
+        self.path_edit = QtWidgets.QLineEdit(str(Path.home()))
+        browse_button = QtWidgets.QPushButton("Browse")
+        browse_button.clicked.connect(self._browse_path)
+        path_row = QtWidgets.QHBoxLayout()
+        path_row.addWidget(self.path_edit)
+        path_row.addWidget(browse_button)
+        form.addRow("Path", path_row)
+
+        float_validator = QtGui.QDoubleValidator(-1e12, 1e12, 6, self)
+
+        self.inline_start_edit = QtWidgets.QLineEdit("0")
+        self.inline_end_edit = QtWidgets.QLineEdit("100")
+        self.crossline_start_edit = QtWidgets.QLineEdit("0")
+        self.crossline_end_edit = QtWidgets.QLineEdit("100")
+        self.sample_start_edit = QtWidgets.QLineEdit("0")
+        self.sample_end_edit = QtWidgets.QLineEdit("60")
+        self.datum_edit = QtWidgets.QLineEdit("0")
+        self.inline_step_edit = QtWidgets.QLineEdit("10")
+        self.inline_size_edit = QtWidgets.QLineEdit("10")
+        self.crossline_step_edit = QtWidgets.QLineEdit("10")
+        self.crossline_size_edit = QtWidgets.QLineEdit("10")
+        self.sample_step_edit = QtWidgets.QLineEdit("10")
+        self.sample_size_edit = QtWidgets.QLineEdit("10")
+        self.inline_num_value = QtWidgets.QLabel("-")
+        self.crossline_num_value = QtWidgets.QLabel("-")
+        self.sample_num_value = QtWidgets.QLabel("-")
+        self._load_grid_history()
+
+        for widget in (
+            self.inline_start_edit,
+            self.inline_end_edit,
+            self.crossline_start_edit,
+            self.crossline_end_edit,
+            self.sample_start_edit,
+            self.sample_end_edit,
+            self.datum_edit,
+            self.inline_step_edit,
+            self.inline_size_edit,
+            self.crossline_step_edit,
+            self.crossline_size_edit,
+            self.sample_step_edit,
+            self.sample_size_edit,
+        ):
+            widget.setValidator(float_validator)
+
+        form.addRow("Datum", self.datum_edit)
+
+        inline_row = QtWidgets.QHBoxLayout()
+        inline_row.setSpacing(6)
+        inline_row.addWidget(QtWidgets.QLabel("Start"))
+        inline_row.addWidget(self.inline_start_edit)
+        inline_row.addWidget(QtWidgets.QLabel("End"))
+        inline_row.addWidget(self.inline_end_edit)
+        inline_row.addWidget(QtWidgets.QLabel("Step"))
+        inline_row.addWidget(self.inline_step_edit)
+        inline_row.addWidget(QtWidgets.QLabel("Size"))
+        inline_row.addWidget(self.inline_size_edit)
+        inline_row.addWidget(QtWidgets.QLabel("Num"))
+        inline_row.addWidget(self.inline_num_value)
+        form.addRow("Inline", inline_row)
+
+        crossline_row = QtWidgets.QHBoxLayout()
+        crossline_row.setSpacing(6)
+        crossline_row.addWidget(QtWidgets.QLabel("Start"))
+        crossline_row.addWidget(self.crossline_start_edit)
+        crossline_row.addWidget(QtWidgets.QLabel("End"))
+        crossline_row.addWidget(self.crossline_end_edit)
+        crossline_row.addWidget(QtWidgets.QLabel("Step"))
+        crossline_row.addWidget(self.crossline_step_edit)
+        crossline_row.addWidget(QtWidgets.QLabel("Size"))
+        crossline_row.addWidget(self.crossline_size_edit)
+        crossline_row.addWidget(QtWidgets.QLabel("Num"))
+        crossline_row.addWidget(self.crossline_num_value)
+        form.addRow("Cxline", crossline_row)
+
+        sample_row = QtWidgets.QHBoxLayout()
+        sample_row.setSpacing(6)
+        sample_row.addWidget(QtWidgets.QLabel("Start"))
+        sample_row.addWidget(self.sample_start_edit)
+        sample_row.addWidget(QtWidgets.QLabel("End"))
+        sample_row.addWidget(self.sample_end_edit)
+        sample_row.addWidget(QtWidgets.QLabel("Step"))
+        sample_row.addWidget(self.sample_step_edit)
+        sample_row.addWidget(QtWidgets.QLabel("Size"))
+        sample_row.addWidget(self.sample_size_edit)
+        sample_row.addWidget(QtWidgets.QLabel("Num"))
+        sample_row.addWidget(self.sample_num_value)
+        form.addRow("Sample", sample_row)
+        layout.addLayout(form)
+
+        for widget in (
+            self.inline_start_edit,
+            self.inline_end_edit,
+            self.inline_step_edit,
+            self.crossline_start_edit,
+            self.crossline_end_edit,
+            self.crossline_step_edit,
+            self.sample_start_edit,
+            self.sample_end_edit,
+            self.sample_step_edit,
+        ):
+            widget.textChanged.connect(self._update_axis_counts)
+        self._update_axis_counts()
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _load_grid_history(self) -> None:
+        self.inline_start_edit.setText(str(self.settings.value("build_model/grid/inline_start", "0")))
+        self.inline_end_edit.setText(str(self.settings.value("build_model/grid/inline_end", "100")))
+        self.crossline_start_edit.setText(str(self.settings.value("build_model/grid/crossline_start", "0")))
+        self.crossline_end_edit.setText(str(self.settings.value("build_model/grid/crossline_end", "100")))
+        self.sample_start_edit.setText(str(self.settings.value("build_model/grid/sample_start", "0")))
+        self.sample_end_edit.setText(str(self.settings.value("build_model/grid/sample_end", "60")))
+        self.datum_edit.setText(str(self.settings.value("build_model/grid/datum", "0")))
+        self.inline_step_edit.setText(str(self.settings.value("build_model/grid/inline_step", self.settings.value("build_model/grid/inline_size", "10"))))
+        self.inline_size_edit.setText(str(self.settings.value("build_model/grid/inline_size", "10")))
+        self.crossline_step_edit.setText(str(self.settings.value("build_model/grid/crossline_step", self.settings.value("build_model/grid/crossline_size", "10"))))
+        self.crossline_size_edit.setText(str(self.settings.value("build_model/grid/crossline_size", "10")))
+        self.sample_step_edit.setText(str(self.settings.value("build_model/grid/sample_step", self.settings.value("build_model/grid/sample_size", "10"))))
+        self.sample_size_edit.setText(str(self.settings.value("build_model/grid/sample_size", "10")))
+
+    def _browse_path(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select Project Base Directory",
+            self.path_edit.text().strip() or str(Path.home()),
+        )
+        if path:
+            self.path_edit.setText(path)
+
+    @staticmethod
+    def _axis_count(start_text: str, end_text: str, step_text: str) -> int | None:
+        try:
+            start = float(start_text or "0")
+            end = float(end_text or "0")
+            step = abs(float(step_text or "0"))
+        except ValueError:
+            return None
+        if step <= 1e-12:
+            return None
+        span = abs(end - start)
+        steps = span / step
+        rounded = round(steps)
+        if abs(steps - rounded) > 1e-9:
+            return None
+        return int(rounded) + 1
+
+    def _update_axis_counts(self) -> None:
+        inline_count = self._axis_count(
+            self.inline_start_edit.text().strip(),
+            self.inline_end_edit.text().strip(),
+            self.inline_step_edit.text().strip(),
+        )
+        crossline_count = self._axis_count(
+            self.crossline_start_edit.text().strip(),
+            self.crossline_end_edit.text().strip(),
+            self.crossline_step_edit.text().strip(),
+        )
+        sample_count = self._axis_count(
+            self.sample_start_edit.text().strip(),
+            self.sample_end_edit.text().strip(),
+            self.sample_step_edit.text().strip(),
+        )
+        self.inline_num_value.setText("-" if inline_count is None else str(inline_count))
+        self.crossline_num_value.setText("-" if crossline_count is None else str(crossline_count))
+        self.sample_num_value.setText("-" if sample_count is None else str(sample_count))
+
+    def values(self) -> tuple[str, Path, GridDefinition] | None:
+        self.last_error = None
+        project_name = self.project_name_edit.text().strip()
+        if not project_name or any(char in project_name for char in '<>:"/\\|?*'):
+            self.last_error = "Please enter a valid project name."
+            return None
+        base_path_text = self.path_edit.text().strip()
+        if not base_path_text:
+            self.last_error = "Please select a valid project path."
+            return None
+        inline_count = self._axis_count(
+            self.inline_start_edit.text().strip(),
+            self.inline_end_edit.text().strip(),
+            self.inline_step_edit.text().strip(),
+        )
+        if inline_count is None:
+            self.last_error = "Inline count must satisfy (end - start) / step + 1 with exact division."
+            return None
+        crossline_count = self._axis_count(
+            self.crossline_start_edit.text().strip(),
+            self.crossline_end_edit.text().strip(),
+            self.crossline_step_edit.text().strip(),
+        )
+        if crossline_count is None:
+            self.last_error = "Cxline count must satisfy (end - start) / step + 1 with exact division."
+            return None
+        sample_count = self._axis_count(
+            self.sample_start_edit.text().strip(),
+            self.sample_end_edit.text().strip(),
+            self.sample_step_edit.text().strip(),
+        )
+        if sample_count is None:
+            self.last_error = "Sample count must satisfy (end - start) / step + 1 with exact division."
+            return None
+        try:
+            definition = GridDefinition(
+                inline_start=float(self.inline_start_edit.text().strip() or "0"),
+                inline_end=float(self.inline_end_edit.text().strip() or "0"),
+                crossline_start=float(self.crossline_start_edit.text().strip() or "0"),
+                crossline_end=float(self.crossline_end_edit.text().strip() or "0"),
+                sample_start=float(self.sample_start_edit.text().strip() or "0"),
+                sample_end=float(self.sample_end_edit.text().strip() or "0"),
+                inline_size=max(1e-6, abs(float(self.inline_size_edit.text().strip() or "1"))),
+                crossline_size=max(1e-6, abs(float(self.crossline_size_edit.text().strip() or "1"))),
+                sample_size=max(1e-6, abs(float(self.sample_size_edit.text().strip() or "1"))),
+                datum=float(self.datum_edit.text().strip() or "0"),
+                inline_step=max(1e-6, abs(float(self.inline_step_edit.text().strip() or "1"))),
+                crossline_step=max(1e-6, abs(float(self.crossline_step_edit.text().strip() or "1"))),
+                sample_step=max(1e-6, abs(float(self.sample_step_edit.text().strip() or "1"))),
+            )
+        except ValueError:
+            self.last_error = "Please enter valid grid parameters."
+            return None
+        return project_name, Path(base_path_text).expanduser().resolve(), definition
+
+
 class SliceUpdater:
     def __init__(
         self,
@@ -3330,14 +3641,15 @@ class SliceUpdater:
         return None
 
     def current_horizon_opacity(self) -> float | None:
-        if self.current_horizon_name is None:
+        horizon = self.current_horizon()
+        if horizon is None:
             return None
-        return float(self.horizons[self.current_horizon_name].opacity)
+        return float(horizon.opacity)
 
     def current_horizon(self) -> HorizonSurface | None:
         if self.current_horizon_name is None:
             return None
-        return self.horizons[self.current_horizon_name]
+        return self.horizons.get(self.current_horizon_name)
 
     def current_scatter(self) -> ScatterDataSet | None:
         if self.current_scatter_name is None:
@@ -3529,9 +3841,11 @@ class SliceUpdater:
         return new_names
 
     def set_current_horizon(self, name: str | None, render: bool = True) -> None:
+        if name is not None and name not in self.horizons:
+            name = None
+        self.current_horizon_name = name
         self.set_current_scatter(None, render=False)
         self.set_current_polygon(None, render=False)
-        self.current_horizon_name = name
         for horizon_name, horizon in self.horizons.items():
             prop = horizon.actor.GetProperty()
             prop.SetColor(*horizon.color)
@@ -4022,9 +4336,9 @@ class SliceUpdater:
     def set_grid_definition(self, definition: GridDefinition, render: bool = True) -> None:
         self.grid_definition = definition
         self.spacing = RenderSpacing(
-            xline=float(definition.crossline_size),
-            inline=float(definition.inline_size),
-            sample=float(definition.sample_size),
+            xline=float(definition.crossline_display_spacing),
+            inline=float(definition.inline_display_spacing),
+            sample=float(definition.sample_display_spacing),
         )
         self.grid_image = create_grid_image(definition)
         self.image = self.grid_image
@@ -4207,6 +4521,7 @@ class SliceUpdater:
         self._remove_control_point_actors(horizon.control_point_set)
         self.renderer.RemoveActor(horizon.actor)
         if self.current_horizon_name == name:
+            self.current_horizon_name = None
             next_name = next(iter(self.horizons), None)
             self.set_current_horizon(next_name, render=False)
         return True
@@ -4594,33 +4909,66 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self._linked_master_point_indices: set[int] = set()
         self._prop_picker = vtk.vtkPropPicker()
         self.data_panel = DataPanelWidget(self)
+        self.project_panel = ProjectPanelWidget(self)
         self._selected_data_item: tuple[str, str] | None = None
         self.build_model_window: BuildModelWindow | None = None
+        self.project_name: str | None = None
+        self.project_dir: Path | None = None
+        self.project_grid_path: Path | None = None
+        self._data_panel_collapsed = False
+        self._left_panel_mode = "data"
 
         self.setWindowTitle(APP_NAME)
-        self.resize(1920, 1400)
+        self._apply_initial_window_geometry()
+        self._apply_soft_theme()
+        self._build_top_menu_bar()
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QHBoxLayout(central)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
 
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
-
+        self.left_sidebar = QtWidgets.QWidget()
+        self.left_sidebar.setObjectName("leftSidebar")
+        self.left_sidebar_layout = QtWidgets.QVBoxLayout(self.left_sidebar)
+        self.left_sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_sidebar_layout.setSpacing(8)
+        self.left_sidebar.setMinimumWidth(300)
+        self.left_sidebar.setMaximumWidth(380)
         self.data_panel.setMinimumWidth(300)
         self.data_panel.setMaximumWidth(380)
-        layout.addWidget(self.data_panel, stretch=0)
+        self.project_panel.setMinimumWidth(300)
+        self.project_panel.setMaximumWidth(380)
+        self.left_panel_stack = QtWidgets.QStackedWidget()
+        self.left_panel_stack.addWidget(self.data_panel)
+        self.left_panel_stack.addWidget(self.project_panel)
+        self.left_sidebar_layout.addWidget(self.left_panel_stack, stretch=1)
+
+        self.project_info_button = QtWidgets.QPushButton("P")
+        self.project_info_button.setObjectName("leftSidebarQuickButton")
+        self.project_info_button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.project_info_button.setToolTip("Project Information")
+        self.project_info_button.clicked.connect(self.open_project_info_dialog)
+        self.project_info_button.hide()
+        self.left_sidebar_layout.addWidget(self.project_info_button, stretch=0, alignment=QtCore.Qt.AlignmentFlag.AlignTop)
+
+        self.data_panel_restore_button = QtWidgets.QPushButton("D")
+        self.data_panel_restore_button.setObjectName("leftSidebarQuickButton")
+        self.data_panel_restore_button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.data_panel_restore_button.setToolTip("Show Data Panel")
+        self.data_panel_restore_button.clicked.connect(self.expand_data_panel)
+        self.data_panel_restore_button.hide()
+        self.left_sidebar_layout.addWidget(self.data_panel_restore_button, stretch=0, alignment=QtCore.Qt.AlignmentFlag.AlignTop)
+        self.left_sidebar_layout.addStretch(1)
+        layout.addWidget(self.left_sidebar, stretch=0)
 
         viewer_panel = QtWidgets.QWidget()
         viewer_layout = QtWidgets.QVBoxLayout(viewer_panel)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
-        viewer_header = QtWidgets.QLabel("3D View")
-        viewer_header_font = QtGui.QFont()
-        viewer_header_font.setPointSize(18)
-        viewer_header_font.setBold(True)
-        viewer_header.setFont(viewer_header_font)
-        viewer_layout.addWidget(viewer_header)
+        viewer_layout.setSpacing(0)
         self.vtk_widget.setMinimumSize(1000, 900)
+        self.vtk_widget.setStyleSheet("")
         viewer_layout.addWidget(self.vtk_widget, stretch=1)
         layout.addWidget(viewer_panel, stretch=1)
 
@@ -4631,10 +4979,6 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         panel_layout = QtWidgets.QVBoxLayout(panel)
         panel_layout.setContentsMargins(0, 0, 0, 0)
         panel_layout.setSpacing(8)
-
-        self.load_seismic_button = QtWidgets.QPushButton("Load Seismic Data")
-        self.load_seismic_button.clicked.connect(self.open_load_seismic_dialog)
-        panel_layout.addWidget(self.load_seismic_button)
 
         self.extract_button = QtWidgets.QPushButton("Open Range Extraction")
         self.extract_button.clicked.connect(self.open_extract_range_dialog)
@@ -4776,6 +5120,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.xline_control.value_changed.connect(lambda index: self._set_index("xline", index))
         self.inline_control.value_changed.connect(lambda index: self._set_index("inline", index))
         self.sample_control.value_changed.connect(lambda index: self._set_index("sample", index))
+        self.data_panel.header_clicked.connect(self.toggle_data_panel)
+        self.project_panel.header_clicked.connect(self.toggle_data_panel)
         self.data_panel.item_activated.connect(self.activate_data_item)
         self.data_panel.category_load_requested.connect(self.load_data_for_category)
         self.data_panel.item_store_requested.connect(self.store_data_item)
@@ -4783,9 +5129,380 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
 
         self.refresh_axis_controls()
         self.refresh_data_panel()
+        self.refresh_project_panel()
         self.refresh_info()
         self.refresh_display_controls()
         self.vtk_widget.installEventFilter(self)
+
+    def _apply_initial_window_geometry(self) -> None:
+        default_width = 1440
+        default_height = 920
+        screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(default_width, default_height)
+            return
+
+        available = screen.availableGeometry()
+        width = min(default_width, max(1100, available.width() - 120))
+        height = min(default_height, max(760, available.height() - 120))
+        width = min(width, available.width())
+        height = min(height, available.height())
+        self.resize(width, height)
+
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
+
+    def _apply_soft_theme(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget {
+                background: #FFFFFF;
+                color: #111111;
+            }
+            QWidget#leftSidebar {
+                background: #FFFFFF;
+            }
+            QMenuBar {
+                background: #FFFFFF;
+                color: #111111;
+                border-bottom: 1px solid #E5E5E5;
+            }
+            QMenuBar::item {
+                background: transparent;
+                padding: 6px 10px;
+                margin: 2px 4px;
+                border-radius: 6px;
+            }
+            QMenuBar::item:selected {
+                background: #F5F5F5;
+            }
+            QMenu {
+                background: #FFFFFF;
+                color: #111111;
+                border: 1px solid #E5E5E5;
+            }
+            QMenu::item {
+                padding: 7px 22px 7px 12px;
+            }
+            QMenu::item:selected {
+                background: #F5F5F5;
+            }
+            QGroupBox {
+                background: #FFFFFF;
+                border: 1px solid #E5E5E5;
+                border-radius: 10px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 4px;
+                color: #111111;
+            }
+            QPushButton {
+                background: #FFFFFF;
+                color: #111111;
+                border: 1px solid #DADADA;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background: #FAFAFA;
+                border-color: #CFCFCF;
+            }
+            QPushButton:pressed {
+                background: #F0F0F0;
+            }
+            QPushButton:disabled {
+                background: #FFFFFF;
+                color: #A0A0A0;
+                border-color: #ECECEC;
+            }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+                background: #FFFFFF;
+                color: #111111;
+                border: 1px solid #DADADA;
+                border-radius: 8px;
+                padding: 6px 8px;
+                selection-background-color: #EDEDED;
+            }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+                border: 1px solid #BDBDBD;
+            }
+            QToolButton {
+                background: transparent;
+                color: #111111;
+                border: none;
+                padding: 4px 0;
+                text-align: left;
+            }
+            QToolButton:hover {
+                color: #000000;
+            }
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #E8E8E8;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #CFCFCF;
+                border: 1px solid #BDBDBD;
+                width: 16px;
+                margin: -6px 0;
+                border-radius: 8px;
+            }
+            QLabel {
+                color: #111111;
+            }
+            QTreeWidget, QListWidget {
+                background: #FFFFFF;
+                alternate-background-color: #FFFFFF;
+                border: 1px solid #E5E5E5;
+                border-radius: 8px;
+            }
+            QHeaderView::section {
+                background: #FFFFFF;
+                color: #111111;
+                border: none;
+                border-bottom: 1px solid #E5E5E5;
+                padding: 6px 8px;
+            }
+            QScrollBar:vertical, QScrollBar:horizontal {
+                background: #FFFFFF;
+                border-radius: 6px;
+            }
+            QPushButton#leftSidebarQuickButton {
+                background: #FFFFFF;
+                color: #111111;
+                border: 1px solid #E5E5E5;
+                border-radius: 4px;
+                padding: 0px;
+                min-width: 24px;
+                max-width: 24px;
+                min-height: 24px;
+                max-height: 24px;
+                text-align: center;
+                font-weight: 600;
+                font-size: 17px;
+            }
+            QPushButton#leftSidebarQuickButton:hover {
+                background: #F7F7F7;
+                border-color: #D6D6D6;
+            }
+            """
+        )
+
+    def collapse_data_panel(self) -> None:
+        if self._data_panel_collapsed:
+            return
+        self._data_panel_collapsed = True
+        self.left_panel_stack.hide()
+        self.project_info_button.show()
+        self.data_panel_restore_button.show()
+        self.left_sidebar.setMinimumWidth(26)
+        self.left_sidebar.setMaximumWidth(26)
+        self.left_sidebar.updateGeometry()
+        self.schedule_render()
+
+    def expand_data_panel(self) -> None:
+        if not self._data_panel_collapsed:
+            self._show_left_panel("data")
+            return
+        self._data_panel_collapsed = False
+        self._left_panel_mode = "data"
+        self.project_info_button.hide()
+        self.data_panel_restore_button.hide()
+        self.left_panel_stack.setCurrentWidget(self.data_panel)
+        self.left_panel_stack.show()
+        self.left_sidebar.setMinimumWidth(300)
+        self.left_sidebar.setMaximumWidth(380)
+        self.left_sidebar.updateGeometry()
+        self.schedule_render()
+
+    def open_project_info_dialog(self) -> None:
+        self._show_left_panel("project")
+
+    def toggle_data_panel(self) -> None:
+        if self._data_panel_collapsed:
+            self.expand_data_panel()
+        else:
+            self.collapse_data_panel()
+
+    def _show_left_panel(self, mode: str) -> None:
+        self._left_panel_mode = "project" if mode == "project" else "data"
+        if self._data_panel_collapsed:
+            self._data_panel_collapsed = False
+            self.project_info_button.hide()
+            self.data_panel_restore_button.hide()
+            self.left_sidebar.setMinimumWidth(300)
+            self.left_sidebar.setMaximumWidth(380)
+        self.left_panel_stack.setCurrentWidget(self.project_panel if self._left_panel_mode == "project" else self.data_panel)
+        self.left_panel_stack.show()
+        self.left_sidebar.updateGeometry()
+        self.schedule_render()
+
+    def _build_top_menu_bar(self) -> None:
+        menu_bar = self.menuBar()
+        menu_bar.setNativeMenuBar(True)
+        file_menu = menu_bar.addMenu("&File")
+        new_project_action = QtGui.QAction("New Project", self)
+        new_project_action.setShortcut(QtGui.QKeySequence.StandardKey.New)
+        new_project_action.triggered.connect(self.open_new_project_dialog)
+        file_menu.addAction(new_project_action)
+        load_segy_action = QtGui.QAction("Load Segy", self)
+        load_segy_action.triggered.connect(self.open_load_seismic_dialog)
+        file_menu.addAction(load_segy_action)
+
+    def open_new_project_dialog(self) -> None:
+        dialog = NewProjectDialog(self)
+        if dialog.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return
+        values = dialog.values()
+        if values is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Invalid Project",
+                dialog.last_error or "Please enter a valid project name, path, and grid parameters.",
+            )
+            return
+        project_name, base_dir, definition = values
+        project_dir = base_dir / project_name
+        if project_dir.exists() and any(project_dir.iterdir()):
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Project Exists",
+                f"The project directory already exists and is not empty:\n{project_dir}\n\nContinue and reuse it?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        self.create_new_project(project_name, project_dir, definition)
+
+    def _project_subdir(self, *parts: str) -> Path | None:
+        if self.project_dir is None:
+            return None
+        return self.project_dir.joinpath(*parts)
+
+    def _ensure_project_structure(self, project_name: str, project_dir: Path, definition: GridDefinition) -> Path:
+        project_dir.mkdir(parents=True, exist_ok=True)
+        for path in (
+            project_dir / "config",
+            project_dir / "grid",
+            project_dir / "raw",
+            project_dir / "raw" / "seismic",
+            project_dir / "raw" / "attribute",
+            project_dir / "raw" / "scatter",
+            project_dir / "raw" / "polygon",
+            project_dir / "raw" / "model",
+            project_dir / "raw" / "well",
+            project_dir / "derived",
+            project_dir / "derived" / "seismic",
+            project_dir / "derived" / "attribute",
+            project_dir / "derived" / "horizon",
+            project_dir / "derived" / "scatter",
+            project_dir / "derived" / "polygon",
+            project_dir / "derived" / "model",
+            project_dir / "derived" / "well",
+            project_dir / "export",
+            project_dir / "temp",
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+
+        grid_path = project_dir / "grid" / "grid_definition.json"
+        definition.to_json_file(grid_path)
+
+        project_payload = {
+            "project_name": project_name,
+            "project_dir": str(project_dir),
+            "grid_definition_path": str(grid_path),
+            "derived_dir": str(project_dir / "derived"),
+            "raw_dir": str(project_dir / "raw"),
+            "export_dir": str(project_dir / "export"),
+        }
+        (project_dir / "config" / "project.json").write_text(
+            json.dumps(project_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return grid_path
+
+    @staticmethod
+    def _persist_grid_history(definition: GridDefinition) -> None:
+        settings = QtCore.QSettings("wesi3d", APP_NAME)
+        settings.setValue("build_model/grid/inline_start", definition.inline_start)
+        settings.setValue("build_model/grid/inline_end", definition.inline_end)
+        settings.setValue("build_model/grid/crossline_start", definition.crossline_start)
+        settings.setValue("build_model/grid/crossline_end", definition.crossline_end)
+        settings.setValue("build_model/grid/sample_start", definition.sample_start)
+        settings.setValue("build_model/grid/sample_end", definition.sample_end)
+        settings.setValue("build_model/grid/datum", definition.datum)
+        settings.setValue("build_model/grid/inline_step", definition.inline_size if definition.inline_step is None else definition.inline_step)
+        settings.setValue("build_model/grid/crossline_step", definition.crossline_size if definition.crossline_step is None else definition.crossline_step)
+        settings.setValue("build_model/grid/sample_step", definition.sample_size if definition.sample_step is None else definition.sample_step)
+        settings.setValue("build_model/grid/inline_size", definition.inline_size)
+        settings.setValue("build_model/grid/crossline_size", definition.crossline_size)
+        settings.setValue("build_model/grid/sample_size", definition.sample_size)
+
+    def create_new_project(self, project_name: str, project_dir: Path, definition: GridDefinition) -> None:
+        for name in list(self.updater.horizon_names()):
+            self.updater.remove_horizon(name)
+        for name in list(self.updater.scatter_names()):
+            self.updater.remove_scatter(name)
+        for name in list(self.updater.polygon_names()):
+            self.updater.remove_polygon(name)
+        for name in list(self.updater.model_names()):
+            self.updater.remove_model_surface(name)
+        for name in list(self.updater.attribute_names()):
+            self.updater.remove_attribute(name)
+
+        if self.updater.grid_actor is not None:
+            self.renderer.RemoveActor(self.updater.grid_actor)
+            self.updater.grid_actor = None
+        self.updater.grid_image = None
+        self.updater.grid_definition = None
+        self.updater.segy_path = None
+        self.updater.current_attribute_name = None
+        self.updater.current_scatter_name = None
+        self.updater.current_polygon_name = None
+        self.updater.current_model_name = None
+        self.updater.current_horizon_name = None
+
+        grid_path = self._ensure_project_structure(project_name, project_dir, definition)
+        self.project_name = project_name
+        self.project_dir = project_dir
+        self.project_grid_path = grid_path
+        self.setWindowTitle(f"{APP_NAME} - {project_name}")
+
+        placeholder_image, _ = create_placeholder_image()
+        self.updater.image = placeholder_image
+        self.image = placeholder_image
+        self.updater.indices = {
+            "xline": 0,
+            "inline": 0,
+            "sample": 0,
+        }
+        self.updater._sync_axes_from_current_attribute()
+        self.updater.set_grid_definition(definition, render=False)
+        self._persist_grid_history(definition)
+        if self.build_model_window is not None:
+            self.build_model_window.save_grid_history(definition)
+        self.updater.update_overlay()
+        self.updater.refresh_scalar_bar()
+
+        self._selected_data_item = None
+        self._selected_master_point_index = None
+        self._linked_master_point_indices.clear()
+        self._refresh_selected_master_actor()
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        self.refresh_data_panel()
+        self.refresh_project_panel()
+        self.refresh_info()
+        configure_default_camera(self.renderer, self.updater.scene_image())
+        self.schedule_render()
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
@@ -5051,6 +5768,24 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             selected_category, selected_name = self._selected_data_item
             self.data_panel.select_item(selected_category, selected_name)
         self.refresh_display_controls()
+
+    def refresh_project_panel(self) -> None:
+        definition = self.updater.grid_definition
+        entries: list[tuple[str, str]] = [
+            ("Project Name", "-" if self.project_name is None else self.project_name),
+            ("Project Path", "-" if self.project_dir is None else str(self.project_dir)),
+            ("Grid File", "-" if self.project_grid_path is None else str(self.project_grid_path)),
+        ]
+        if definition is not None:
+            entries.extend(
+                [
+                    ("Datum", str(definition.datum)),
+                    ("Inline", f"{definition.inline_start} -> {definition.inline_end}"),
+                    ("Cxline", f"{definition.crossline_start} -> {definition.crossline_end}"),
+                    ("Sample", f"{definition.sample_start} -> {definition.sample_end}"),
+                ]
+            )
+        self.project_panel.set_info(entries)
 
     def activate_data_item(self, category: str, name: str) -> None:
         self._selected_data_item = (category, name)
@@ -5956,7 +6691,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         return value
 
     def _default_output_dir(self, category: str) -> Path:
-        path = DERIVED_DATA_DIR / category
+        project_derived_dir = self._project_subdir("derived", category)
+        path = project_derived_dir if project_derived_dir is not None else DERIVED_DATA_DIR / category
         path.mkdir(parents=True, exist_ok=True)
         return path
 

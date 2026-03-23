@@ -17,16 +17,17 @@ class DataPanelWidget(QtWidgets.QWidget):
     item_activated = QtCore.Signal(str, str)
     item_store_requested = QtCore.Signal(str, str)
     item_unload_requested = QtCore.Signal(str, str)
+    header_clicked = QtCore.Signal()
 
     CATEGORY_ORDER = ("seismic", "attribute", "horizon", "scatter", "polygon", "model", "well")
     CATEGORY_LABELS = {
-        "seismic": "地震",
-        "attribute": "属性",
-        "horizon": "层位",
-        "scatter": "散点",
-        "polygon": "多边形",
-        "model": "模型",
-        "well": "井",
+        "seismic": "Seismic",
+        "attribute": "Attribute",
+        "horizon": "Horizon",
+        "scatter": "Scatter",
+        "polygon": "Polygon",
+        "model": "Model",
+        "well": "Well",
     }
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
@@ -37,12 +38,16 @@ class DataPanelWidget(QtWidgets.QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        header = QtWidgets.QLabel("数据目录")
+        self.header_button = QtWidgets.QToolButton()
+        self.header_button.setText("Data")
+        self.header_button.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.header_button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.header_button.clicked.connect(self.header_clicked.emit)
         font = QtGui.QFont()
         font.setPointSize(16)
         font.setBold(True)
-        header.setFont(font)
-        layout.addWidget(header)
+        self.header_button.setFont(font)
+        layout.addWidget(self.header_button)
 
         self.tree = QtWidgets.QTreeWidget()
         self.tree.setHeaderHidden(True)
@@ -122,11 +127,11 @@ class DataPanelWidget(QtWidgets.QWidget):
 
         menu = QtWidgets.QMenu(self)
         if payload.get("kind") == "category":
-            action = menu.addAction("加载")
+            action = menu.addAction("Load")
             action.triggered.connect(lambda: self.category_load_requested.emit(str(payload["category"])))
         elif payload.get("kind") == "data":
-            store_action = menu.addAction("存储")
-            unload_action = menu.addAction("卸载")
+            store_action = menu.addAction("Store")
+            unload_action = menu.addAction("Unload")
             category = str(payload["category"])
             name = str(payload["name"])
             store_action.triggered.connect(lambda: self.item_store_requested.emit(category, name))
@@ -137,3 +142,42 @@ class DataPanelWidget(QtWidgets.QWidget):
 
 
 DataPanelWindow = DataPanelWidget
+
+
+class ProjectPanelWidget(QtWidgets.QWidget):
+    header_clicked = QtCore.Signal()
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.header_button = QtWidgets.QToolButton()
+        self.header_button.setText("Project")
+        self.header_button.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.header_button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.header_button.clicked.connect(self.header_clicked.emit)
+        font = QtGui.QFont()
+        font.setPointSize(16)
+        font.setBold(True)
+        self.header_button.setFont(font)
+        layout.addWidget(self.header_button)
+
+        self.info_tree = QtWidgets.QTreeWidget()
+        self.info_tree.setHeaderLabels(["Field", "Value"])
+        self.info_tree.setRootIsDecorated(False)
+        self.info_tree.setAlternatingRowColors(False)
+        self.info_tree.header().setStretchLastSection(True)
+        self.info_tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.info_tree.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.info_tree, stretch=1)
+
+    def set_info(self, entries: list[tuple[str, str]]) -> None:
+        self.info_tree.clear()
+        for label, value in entries:
+            item = QtWidgets.QTreeWidgetItem([label, value])
+            item.setToolTip(0, label)
+            item.setToolTip(1, value)
+            self.info_tree.addTopLevelItem(item)
