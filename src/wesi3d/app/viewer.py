@@ -2773,6 +2773,109 @@ class LoadSeismicDialog(QtWidgets.QDialog):
             return None
 
 
+class LoadSeismicDialog2(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget | None = None, target_category: str = "seismic") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Load Segy2")
+        self.setModal(True)
+        self.resize(760, self.sizeHint().height())
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+
+        self.path_edit = QtWidgets.QLineEdit()
+        self.path_edit.setMinimumWidth(520)
+        browse_button = QtWidgets.QPushButton("Browse")
+        browse_button.clicked.connect(self._browse_path)
+        path_row = QtWidgets.QHBoxLayout()
+        path_row.addWidget(self.path_edit)
+        path_row.addWidget(browse_button)
+        form.addRow("Segy File", path_row)
+
+        self.name_edit = QtWidgets.QLineEdit()
+        form.addRow("Name", self.name_edit)
+
+        self.inline_field_edit = QtWidgets.QLineEdit(str(INLINE_FIELD))
+        self.xline_field_edit = QtWidgets.QLineEdit(str(XLINE_FIELD))
+        for widget in (self.inline_field_edit, self.xline_field_edit):
+            widget.setValidator(QtGui.QIntValidator(1, 10**9, self))
+        form.addRow("Inline Header Field", self.inline_field_edit)
+        form.addRow("Xline Header Field", self.xline_field_edit)
+
+        self.target_combo = QtWidgets.QComboBox()
+        self.target_combo.setMinimumContentsLength(12)
+        self.target_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.target_combo.addItem("Seismic", "seismic")
+        self.target_combo.addItem("Attribute", "attribute")
+        index = 0 if target_category == "seismic" else 1
+        self.target_combo.setCurrentIndex(index)
+        form.addRow("Import As", self.target_combo)
+
+        int_validator = QtGui.QIntValidator(1, 10**9, self)
+        float_validator = QtGui.QDoubleValidator(self)
+
+        self.interval_inline_edit = QtWidgets.QLineEdit(str(DEFAULT_VIEWER_CONFIG.interval_inline))
+        self.interval_xline_edit = QtWidgets.QLineEdit(str(DEFAULT_VIEWER_CONFIG.interval_xline))
+        self.interval_sample_edit = QtWidgets.QLineEdit(str(DEFAULT_VIEWER_CONFIG.interval_sample))
+        for widget in (self.interval_inline_edit, self.interval_xline_edit, self.interval_sample_edit):
+            widget.setValidator(int_validator)
+        form.addRow("Inline Interval", self.interval_inline_edit)
+        form.addRow("Xline Interval", self.interval_xline_edit)
+        form.addRow("Sample Interval", self.interval_sample_edit)
+
+        self.step_inline_edit = QtWidgets.QLineEdit(format_value(DEFAULT_VIEWER_CONFIG.step_inline))
+        self.step_xline_edit = QtWidgets.QLineEdit(format_value(DEFAULT_VIEWER_CONFIG.step_xline))
+        self.step_sample_edit = QtWidgets.QLineEdit(format_value(DEFAULT_VIEWER_CONFIG.step_sample))
+        for widget in (self.step_inline_edit, self.step_xline_edit, self.step_sample_edit):
+            widget.setValidator(float_validator)
+        form.addRow("Inline Step", self.step_inline_edit)
+        form.addRow("Xline Step", self.step_xline_edit)
+        form.addRow("Sample Step", self.step_sample_edit)
+
+        layout.addLayout(form)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _browse_path(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select SEG-Y File",
+            "",
+            "SEG-Y Files (*.sgy *.segy);;All Files (*)",
+        )
+        if path:
+            self.path_edit.setText(path)
+            if not self.name_edit.text().strip():
+                self.name_edit.setText(Path(path).stem)
+
+    def values(self) -> dict[str, object] | None:
+        path_text = self.path_edit.text().strip()
+        if not path_text:
+            return None
+        try:
+            return {
+                "path": path_text,
+                "name": self.name_edit.text().strip() or Path(path_text).stem,
+                "target_category": str(self.target_combo.currentData()),
+                "interval_inline": max(1, int(self.interval_inline_edit.text().strip() or "1")),
+                "interval_xline": max(1, int(self.interval_xline_edit.text().strip() or "1")),
+                "interval_sample": max(1, int(self.interval_sample_edit.text().strip() or "1")),
+                "step_inline": float(self.step_inline_edit.text().strip() or "1"),
+                "step_xline": float(self.step_xline_edit.text().strip() or "1"),
+                "step_sample": float(self.step_sample_edit.text().strip() or "1"),
+                "inline_field": int(self.inline_field_edit.text().strip() or str(INLINE_FIELD)),
+                "xline_field": int(self.xline_field_edit.text().strip() or str(XLINE_FIELD)),
+            }
+        except ValueError:
+            return None
+
+
 class BuildModelWindow(QtWidgets.QDialog):
     define_grid_requested = QtCore.Signal()
     load_dip_direction_requested = QtCore.Signal()
@@ -5355,6 +5458,9 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         load_segy_action = QtGui.QAction("Load Segy", self)
         load_segy_action.triggered.connect(self.open_load_seismic_dialog)
         file_menu.addAction(load_segy_action)
+        load_segy2_action = QtGui.QAction("Load Segy2", self)
+        load_segy2_action.triggered.connect(self.open_load_seismic_dialog2)
+        file_menu.addAction(load_segy2_action)
 
     def open_new_project_dialog(self) -> None:
         dialog = NewProjectDialog(self)
@@ -6061,6 +6167,15 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
             return
         self.load_segy_volume(values)
 
+    def open_load_seismic_dialog2(self, target_category: str = "seismic") -> None:
+        dialog = LoadSeismicDialog2(self, target_category=target_category)
+        if dialog.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
+            return
+        values = dialog.values()
+        if values is None:
+            return
+        self.load_segy_volume2(values)
+
     def open_build_model_window(self) -> None:
         if self.build_model_window is None:
             self.build_model_window = BuildModelWindow(self)
@@ -6593,6 +6708,61 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
         self.schedule_render()
 
     def load_segy_volume(self, values: dict[str, object]) -> None:
+        segy_path = Path(str(values["path"])).expanduser().resolve()
+        if not segy_path.exists():
+            QtWidgets.QMessageBox.information(self, "Missing File", f"SEG-Y file not found:\n{segy_path}")
+            return
+
+        geometry = load_segy_geometry(
+            segy_path,
+            inline_field=int(values["inline_field"]),
+            xline_field=int(values["xline_field"]),
+        )
+        volume_data = read_segy_volume(
+            segy_path=segy_path,
+            geometry=geometry,
+            interval_inline=int(values["interval_inline"]),
+            interval_xline=int(values["interval_xline"]),
+            interval_sample=int(values["interval_sample"]),
+            inline_field=int(values["inline_field"]),
+            xline_field=int(values["xline_field"]),
+            name=str(values["name"]),
+        )
+        category = str(values["target_category"])
+        volume_data = volume_data.with_data(
+            volume_data.data,
+            metadata={
+                **volume_data.metadata,
+                "panel_category": category,
+            },
+        )
+
+        self.updater.spacing = RenderSpacing(
+            xline=float(values["step_xline"]),
+            inline=float(values["step_inline"]),
+            sample=float(values["step_sample"]),
+        )
+        self.updater.segy_path = segy_path
+        name = self.updater.add_attribute_volume(
+            volume_data,
+            name=str(values["name"]),
+            opacity=self.updater.opacity,
+            select=True,
+        )
+        self.image = self.updater.image
+        self._selected_data_item = (category, name)
+        self.refresh_axis_controls()
+        self.refresh_scene_guides()
+        self.updater.set_index("xline", len(self.updater.xlines) // 2, render=False)
+        self.updater.set_index("inline", len(self.updater.inlines) // 2, render=False)
+        self.updater.set_index("sample", len(self.updater.samples) // 2, render=False)
+        self.refresh_axis_controls()
+        configure_default_camera(self.renderer, self.updater.image)
+        self.refresh_info()
+        self.refresh_data_panel()
+        self.schedule_render()
+
+    def load_segy_volume2(self, values: dict[str, object]) -> None:
         segy_path = Path(str(values["path"])).expanduser().resolve()
         if not segy_path.exists():
             QtWidgets.QMessageBox.information(self, "Missing File", f"SEG-Y file not found:\n{segy_path}")
