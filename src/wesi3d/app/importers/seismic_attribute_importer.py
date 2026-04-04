@@ -15,9 +15,15 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[3]))
 
+import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from wesi3d.utils.constants import INLINE_FIELD, XLINE_FIELD
+
+try:
+    import segyio
+except ImportError:
+    segyio = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,22 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
     SCAN_HEADER_MIN = 0
     SCAN_HEADER_MAX = 239
     SCAN_SUPPORTED_FILE_TYPES = {"segy", "su"}
+    FORM_LABEL_TEXTS = (
+        "Input File",
+        "File Type",
+        "Header Map",
+        "Position",
+        "Data Range",
+        "Inline",
+        "Cxline",
+        "Sample",
+        "Grid Points",
+        "P0",
+        "P1",
+        "P3",
+        "Output File",
+        "Output As",
+    )
 
     @classmethod
     def _header_label(cls, text: str) -> QtWidgets.QLabel:
@@ -181,31 +203,87 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
         return True, "ready"
 
     def _perform_scan(self, trigger: str) -> None:
+        path_text = self.path_edit.text().strip()
+        file_type = str(self.file_type_combo.currentData())
+        header_map = self._header_map_values_for_scan()
         self._append_info(f"scan requested by {trigger}")
-        self._append_info(f"path={self.path_edit.text().strip()}")
-        self._append_info(f"file_type={self.file_type_combo.currentData()}")
-        self._append_info(f"header_map={self._header_map_values_for_scan()}")
+        self._append_info(f"path={path_text}")
+        self._append_info(f"file_type={file_type}")
+        self._append_info(f"header_map={header_map}")
 
-    def _maybe_scan(self, trigger: str) -> None:
-        ready, reason = self._scan_ready_state()
-        self._append_info(f"maybe_scan trigger={trigger} ready={ready} reason={reason}")
-        if ready:
-            self._perform_scan(trigger)
+        if segyio is None:
+            self._append_info("scan failed: missing dependency segyio")
+            return
+        if header_map is None:
+            self._append_info("scan failed: invalid header map")
+            return
 
-    def _on_input_file_changed(self, _text: str) -> None:
-        self._maybe_scan("input_file_changed")
+        path = Path(path_text)
+        if not path.exists():
+            self._append_info(f"scan failed: file not found: {path}")
+            return
+
+        try:
+            with self._open_scan_file(path, file_type) as segy:
+                inline_values = np.asarray(segy.attributes(header_map["inline"])[:], dtype=np.int64)
+                xline_values = np.asarray(segy.attributes(header_map["xline"])[:], dtype=np.int64)
+                sample_values = np.asarray(segy.samples, dtype=np.float64)
+        except Exception as exc:
+            self._append_info(f"scan failed: {exc}")
+            return
+
+        if inline_values.size == 0 or xline_values.size == 0 or sample_values.size == 0:
+            self._append_info("scan failed: empty headers or samples")
+            return
+
+        self.begin_inline_edit.setText(str(int(np.min(inline_values))))
+        self.end_inline_edit.setText(str(int(np.max(inline_values))))
+        self.begin_xline_edit.setText(str(int(np.min(xline_values))))
+        self.end_xline_edit.setText(str(int(np.max(xline_values))))
+        self.begin_sample_edit.setText(self._format_axis_value(float(np.min(sample_values))))
+        self.end_sample_edit.setText(self._format_axis_value(float(np.max(sample_values))))
+
+        self._append_info(
+            "scan complete: "
+            f"inline=({self.begin_inline_edit.text()}, {self.end_inline_edit.text()}) "
+            f"cxline=({self.begin_xline_edit.text()}, {self.end_xline_edit.text()}) "
+            f"sample=({self.begin_sample_edit.text()}, {self.end_sample_edit.text()})"
+        )
 
     def _on_file_type_changed(self, _index: int) -> None:
         self._update_header_field_state()
-        self._maybe_scan("file_type_changed")
 
-    def _on_header_map_changed(self, _text: str) -> None:
-        self._maybe_scan("header_map_changed")
+    def _on_scan_clicked(self) -> None:
+        ready, reason = self._scan_ready_state()
+        self._append_info(f"scan_clicked ready={ready} reason={reason}")
+        if not ready:
+            return
+        self._perform_scan("scan_button")
 
     def _append_info(self, message: str) -> None:
         line = f"[SeismicAttributeImportDialog] {message}"
         print(line, flush=True)
         self.info_log.appendPlainText(line)
+
+    @staticmethod
+    def _format_axis_value(value: float) -> str:
+        if float(value).is_integer():
+            return str(int(value))
+        return f"{value:g}"
+
+    @staticmethod
+    def _open_scan_file(path: Path, file_type: str):
+        if file_type == "su":
+            su_module = getattr(segyio, "su", None)
+            if su_module is None or not hasattr(su_module, "open"):
+                raise RuntimeError("segyio.su.open is not available")
+            return su_module.open(str(path), "r", ignore_geometry=True)
+        return segyio.open(str(path), "r", strict=False, ignore_geometry=True)
+
+    def _update_form_label_width(self) -> None:
+        metrics = self.fontMetrics()
+        longest = max(metrics.horizontalAdvance(text) for text in self.FORM_LABEL_TEXTS)
+        type(self).FORM_LABEL_WIDTH = longest + 8
 
     def __init__(
         self,
@@ -217,6 +295,7 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
         self.setWindowTitle("Import Seismic/Attribute Data")
         self.setModal(True)
         initial_values = {} if initial_values is None else dict(initial_values)
+        self._update_form_label_width()
 
         int_validator = QtGui.QIntValidator(1, 10**9, self)
         float_validator = QtGui.QDoubleValidator(self)
@@ -266,6 +345,16 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
                 {"Position": [self.inline_field_edit, self.xline_field_edit, self.x_field_edit, self.y_field_edit]},
             )
         )
+        scan_row = QtWidgets.QWidget()
+        scan_layout = QtWidgets.QHBoxLayout(scan_row)
+        scan_layout.setContentsMargins(0, 0, 0, 0)
+        scan_layout.setSpacing(8)
+        scan_layout.addSpacing(self.FORM_LABEL_WIDTH + 8)
+        scan_layout.addStretch(1)
+        self.scan_button = self._new_button("Scan")
+        self.scan_button.clicked.connect(self._on_scan_clicked)
+        scan_layout.addWidget(self.scan_button)
+        layout.addWidget(scan_row)
         layout.addSpacing(self.SECTION_SPACING)
 
         self.begin_inline_edit = self._new_line_edit(str(initial_values.get("begin_inline", "")), validator=float_validator)
@@ -316,6 +405,12 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
         output_browse_button = self._new_button("Browse")
         output_browse_button.clicked.connect(self._browse_output_path)
 
+        self.target_combo = self._new_combo(
+            [("Seismic", "seismic"), ("Attribute", "attribute")],
+            width=self.COMBO_WIDTH,
+            current_value=str(initial_values.get("target_category", target_category)),
+        )
+
         output_form = QtWidgets.QFormLayout()
         output_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
         output_form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
@@ -323,38 +418,39 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
         output_form.setHorizontalSpacing(8)
         output_form.setVerticalSpacing(4)
         output_form.setContentsMargins(0, 0, 0, 0)
-        output_form.addRow(self._form_label("Output File"), self._new_row_widget([self.output_name_edit, output_browse_button]))
+        output_form.addRow(
+            self._form_label("Output File"),
+            self._new_row_widget([self.output_name_edit, output_browse_button]),
+        )
         layout.addLayout(output_form)
 
-        self.target_combo = self._new_combo(
-            [("Seismic", "seismic"), ("Attribute", "attribute")],
-            width=self.COMBO_WIDTH,
-            current_value=str(initial_values.get("target_category", target_category)),
-        )
         cancel_button = self._new_button("Cancel")
         ok_button = self._new_button("OK")
         cancel_button.clicked.connect(self.reject)
         ok_button.clicked.connect(self.accept)
 
-        target_cancel_row = QtWidgets.QWidget()
-        target_cancel_layout = QtWidgets.QHBoxLayout(target_cancel_row)
-        target_cancel_layout.setContentsMargins(0, 0, 0, 0)
-        target_cancel_layout.setSpacing(self.ROW_SPACING)
-        target_cancel_layout.addWidget(self.target_combo)
-        target_cancel_layout.addStretch(1)
-        target_cancel_layout.addWidget(cancel_button)
-        target_cancel_row.setFixedWidth(self.FILE_EDIT_WIDTH)
-        output_as_row = self._new_row_widget([target_cancel_row, ok_button])
+        output_as_row = QtWidgets.QWidget()
+        output_as_layout = QtWidgets.QHBoxLayout(output_as_row)
+        output_as_layout.setContentsMargins(0, 0, 0, 0)
+        output_as_layout.setSpacing(8)
+        output_as_layout.addWidget(self._form_label("Output As"), alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
 
-        output_as_form = QtWidgets.QFormLayout()
-        output_as_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-        output_as_form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
-        output_as_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        output_as_form.setHorizontalSpacing(8)
-        output_as_form.setVerticalSpacing(4)
-        output_as_form.setContentsMargins(0, 0, 0, 0)
-        output_as_form.addRow(self._form_label("Output As"), output_as_row)
-        layout.addLayout(output_as_form)
+        output_as_field = QtWidgets.QWidget()
+        output_as_field_layout = QtWidgets.QHBoxLayout(output_as_field)
+        output_as_field_layout.setContentsMargins(0, 0, 0, 0)
+        output_as_field_layout.setSpacing(self.ROW_SPACING)
+        output_as_field_layout.addWidget(self.target_combo, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
+        output_as_field_layout.addStretch(1)
+        action_buttons = QtWidgets.QWidget()
+        action_buttons_layout = QtWidgets.QHBoxLayout(action_buttons)
+        action_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        action_buttons_layout.setSpacing(1)
+        action_buttons_layout.addWidget(cancel_button)
+        action_buttons_layout.addWidget(ok_button)
+        output_as_field_layout.addWidget(action_buttons, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        output_as_layout.addWidget(output_as_field, alignment=QtCore.Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(output_as_row)
         layout.addSpacing(self.SECTION_SPACING)
 
         info_container = QtWidgets.QWidget()
@@ -371,10 +467,7 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
         layout.addWidget(info_container)
         self.setFixedWidth(self.FORM_LABEL_WIDTH + self.TABLE_WIDTH + self.HORIZONTAL_MARGIN * 2)
 
-        self.path_edit.textChanged.connect(self._on_input_file_changed)
         self.file_type_combo.currentIndexChanged.connect(self._on_file_type_changed)
-        for widget in self._header_field_edits:
-            widget.textChanged.connect(self._on_header_map_changed)
         self._update_header_field_state()
 
     def _browse_path(self) -> None:
