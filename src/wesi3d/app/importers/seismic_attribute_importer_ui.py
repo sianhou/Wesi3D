@@ -18,6 +18,7 @@ if __package__ in {None, ""}:
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from wesi3d.app.importers.seismic_attribute_importer_service import execute_import
 from wesi3d.processing.survey_grid import GridControlPoint, SurveyGrid
 from wesi3d.utils.constants import INLINE_FIELD, XLINE_FIELD
 
@@ -32,17 +33,33 @@ class SegyImportOptions:
     path: str
     file_type: str
     name: str
+    output_file: str
     target_category: str
+    begin_inline: int
+    begin_xline: int
+    begin_sample: int
+    end_inline: int
+    end_xline: int
+    end_sample: int
     interval_inline: int
     interval_xline: int
     interval_sample: int
     step_inline: float
     step_xline: float
     step_sample: float
+    spacing_inline: int
+    spacing_xline: int
+    spacing_sample: int
     inline_field: int
     xline_field: int
     x_field: int
     y_field: int
+    p0_x: float
+    p0_y: float
+    p1_x: float
+    p1_y: float
+    p3_x: float
+    p3_y: float
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -617,17 +634,33 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
                 path=path_text,
                 file_type=str(self.file_type_combo.currentData()),
                 name=self.output_name_edit.text().strip() or Path(path_text).stem,
+                output_file=self.output_name_edit.text().strip(),
                 target_category=str(self.target_combo.currentData()),
+                begin_inline=int(float(self.begin_inline_edit.text().strip() or "0")),
+                begin_xline=int(float(self.begin_xline_edit.text().strip() or "0")),
+                begin_sample=int(float(self.begin_sample_edit.text().strip() or "0")),
+                end_inline=int(float(self.end_inline_edit.text().strip() or "0")),
+                end_xline=int(float(self.end_xline_edit.text().strip() or "0")),
+                end_sample=int(float(self.end_sample_edit.text().strip() or "0")),
                 interval_inline=max(1, int(self.spacing_inline_edit.text().strip() or "1")),
                 interval_xline=max(1, int(self.spacing_xline_edit.text().strip() or "1")),
                 interval_sample=max(1, int(self.spacing_sample_edit.text().strip() or "1")),
                 step_inline=float(self.step_inline_edit.text().strip() or "1"),
                 step_xline=float(self.step_xline_edit.text().strip() or "1"),
                 step_sample=float(self.step_sample_edit.text().strip() or "1"),
+                spacing_inline=max(1, int(self.spacing_inline_edit.text().strip() or "1")),
+                spacing_xline=max(1, int(self.spacing_xline_edit.text().strip() or "1")),
+                spacing_sample=max(1, int(self.spacing_sample_edit.text().strip() or "1")),
                 inline_field=int(self.inline_field_edit.text().strip() or str(INLINE_FIELD)),
                 xline_field=int(self.xline_field_edit.text().strip() or str(XLINE_FIELD)),
                 x_field=int(self.x_field_edit.text().strip() or "181"),
                 y_field=int(self.y_field_edit.text().strip() or "185"),
+                p0_x=float(self.p0_x_edit.text().strip() or "0"),
+                p0_y=float(self.p0_y_edit.text().strip() or "0"),
+                p1_x=float(self.p1_x_edit.text().strip() or "0"),
+                p1_y=float(self.p1_y_edit.text().strip() or "0"),
+                p3_x=float(self.p3_x_edit.text().strip() or "0"),
+                p3_y=float(self.p3_y_edit.text().strip() or "0"),
             )
         except ValueError:
             return None
@@ -644,12 +677,31 @@ def main() -> int:
         app = QtWidgets.QApplication(sys.argv)
 
     dialog = SeismicAttributeImportDialog()
-    result = dialog.exec()
-    if result == int(QtWidgets.QDialog.DialogCode.Accepted):
-        options = dialog.options()
-        if options is not None:
-            print(options.as_dict(), flush=True)
-            return 0
+    standalone_result: dict[str, object] = {"ok": False}
+
+    def _run_standalone_import(values: dict[str, object]) -> None:
+        try:
+            result = execute_import(values)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(dialog, "Import Failed", str(exc))
+            standalone_result["ok"] = False
+            return
+
+        standalone_result["ok"] = True
+        standalone_result["result"] = result
+        QtWidgets.QMessageBox.information(
+            dialog,
+            "Import Saved",
+            "NPZ file generated successfully.\n\n"
+            f"Path: {result['output_path']}\n"
+            f"Shape: {result['shape']}",
+        )
+
+    dialog.import_requested.connect(_run_standalone_import)
+    dialog.exec()
+    if standalone_result["ok"]:
+        print(standalone_result["result"], flush=True)
+        return 0
     return 1 if owns_app else 0
 
 

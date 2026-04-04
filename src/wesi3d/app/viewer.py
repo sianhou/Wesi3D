@@ -56,7 +56,7 @@ from ..data.attribute_data import (
 )
 from ..data.volume_data import load_segy_geometry, read_segy_volume
 from .data_panel import DataPanelItem, DataPanelWidget, ProjectPanelWidget
-from .importers import SeismicAttributeImportDialog, build_import_request, execute_import
+from .importers import SeismicAttributeImportDialog, execute_import
 from ..processing.control_points import (
     ControlPoint,
     MasterMove,
@@ -6072,18 +6072,18 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
 
     def handle_seismic_attribute_import(self, values: dict[str, object]) -> None:
         print("[Viewer] handle_seismic_attribute_import", flush=True)
-        request = build_import_request(values)
-        result = execute_import(request)
-        print(
-            "[Viewer] import template result:"
-            f" file_type={result.request.file_type}"
-            f" category={result.request.target_category}"
-            f" cache_path={result.cache_path}",
-            flush=True,
+        try:
+            result = execute_import(values)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Import Failed", str(exc))
+            return
+        QtWidgets.QMessageBox.information(
+            self,
+            "Import Saved",
+            "NPZ file generated successfully.\n\n"
+            f"Path: {result['output_path']}\n"
+            f"Shape: {result['shape']}",
         )
-        # Temporary bridge: keep using the existing SEG-Y load path until the
-        # new import service gains real loading implementations.
-        self.load_segy_volume(result.values)
 
     def open_build_model_window(self) -> None:
         if self.build_model_window is None:
