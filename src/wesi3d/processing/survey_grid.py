@@ -14,7 +14,7 @@ JSONDict = dict[str, Any]
 RealPoint = tuple[float, float]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class GridControlPoint:
     name: str
     rw: RealPoint
@@ -48,7 +48,7 @@ class GridControlPoint:
         )
 
 
-@dataclass(slots=True)
+@dataclass
 class SurveyGrid:
     """Survey work-area grid defined by ordered control points.
 
@@ -63,8 +63,8 @@ class SurveyGrid:
     point1: GridControlPoint
     point2: GridControlPoint
     point3: GridControlPoint
-    step_inl: float = field(init=False)
-    step_cxl: float = field(init=False)
+    spacing_inl: float = field(init=False)
+    spacing_cxl: float = field(init=False)
     _inl_unit: RealPoint = field(init=False, repr=False)
     _cxl_unit: RealPoint = field(init=False, repr=False)
 
@@ -84,8 +84,8 @@ class SurveyGrid:
         if len_inl == 0 or len_cxl == 0:
             raise ValueError("Control point real coordinates must not collapse to zero-length axes")
 
-        self.step_inl = len_inl / abs(span_inl)
-        self.step_cxl = len_cxl / abs(span_cxl)
+        self.spacing_inl = len_inl / abs(span_inl)
+        self.spacing_cxl = len_cxl / abs(span_cxl)
         self._inl_unit = (vec_inl[0] / len_inl, vec_inl[1] / len_inl)
         self._cxl_unit = (vec_cxl[0] / len_cxl, vec_cxl[1] / len_cxl)
 
@@ -122,8 +122,8 @@ class SurveyGrid:
         return ang if ang >= 0 else ang + 360.0
 
     def rw_from_grid(self, inl: float, cxl: float) -> RealPoint:
-        dist_inl = (float(inl) - self.point0.inl) * self.step_inl
-        dist_cxl = (float(cxl) - self.point0.cxl) * self.step_cxl
+        dist_inl = (float(inl) - self.point0.inl) * self.spacing_inl
+        dist_cxl = (float(cxl) - self.point0.cxl) * self.spacing_cxl
         return (
             self.point0.rw_x + dist_inl * self._inl_unit[0] + dist_cxl * self._cxl_unit[0],
             self.point0.rw_y + dist_inl * self._inl_unit[1] + dist_cxl * self._cxl_unit[1],
@@ -133,8 +133,8 @@ class SurveyGrid:
         rel = _vec(self.point0.rw, rw)
         dist_inl = _dot(rel, self._inl_unit)
         dist_cxl = _dot(rel, self._cxl_unit)
-        inl = self.point0.inl + dist_inl / self.step_inl
-        cxl = self.point0.cxl + dist_cxl / self.step_cxl
+        inl = self.point0.inl + dist_inl / self.spacing_inl
+        cxl = self.point0.cxl + dist_cxl / self.spacing_cxl
         return (float(inl), float(cxl))
 
     def locate_rw(self, rw: RealPoint) -> tuple[float, float, float, float]:
@@ -147,8 +147,8 @@ class SurveyGrid:
             "  control_order: Point0 -> Point1 -> Point2 -> Point3",
             "  point_meaning: Point0=origin, Point1=first inline last point, Point2=diagonal point, Point3=last inline first point",
             "  direction_rule: Point0->Point3 defines inl direction, Point0->Point1 defines cxl direction, angle uses North=0 and clockwise positive",
-            f"  step_inl: {self.step_inl} (distance(Point0, Point3) / inl interval)",
-            f"  step_cxl: {self.step_cxl} (distance(Point0, Point1) / cxl interval)",
+            f"  spacing_inl: {self.spacing_inl} (distance(Point0, Point3) / inl interval)",
+            f"  spacing_cxl: {self.spacing_cxl} (distance(Point0, Point1) / cxl interval)",
             f"  inl_unit: ({self._inl_unit[0]:.6f}, {self._inl_unit[1]:.6f})",
             f"  cxl_unit: ({self._cxl_unit[0]:.6f}, {self._cxl_unit[1]:.6f})",
             f"  inl_angle_deg: {self.inl_angle_deg:.6f}",

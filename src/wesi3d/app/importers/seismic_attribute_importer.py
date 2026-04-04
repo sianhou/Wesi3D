@@ -18,6 +18,7 @@ if __package__ in {None, ""}:
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from wesi3d.processing.survey_grid import GridControlPoint, SurveyGrid
 from wesi3d.utils.constants import INLINE_FIELD, XLINE_FIELD
 
 try:
@@ -48,6 +49,8 @@ class SegyImportOptions:
 
 
 class SeismicAttributeImportDialog(QtWidgets.QDialog):
+    import_requested = QtCore.Signal(dict)
+
     CELL_WIDTH = 96
     COMBO_WIDTH = 120
     BUTTON_WIDTH = 96
@@ -225,9 +228,56 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
 
         try:
             with self._open_scan_file(path, file_type) as segy:
-                inline_values = np.asarray(segy.attributes(header_map["inline"])[:], dtype=np.int64)
-                xline_values = np.asarray(segy.attributes(header_map["xline"])[:], dtype=np.int64)
                 sample_values = np.asarray(segy.samples, dtype=np.float64)
+                trace_count = int(segy.tracecount)
+                if trace_count <= 0:
+                    raise RuntimeError("file contains no traces")
+                first_trace = 0
+                last_trace = trace_count - 1
+                second_trace = 1 if trace_count > 1 else 0
+                inline_values = np.asarray(
+                    [
+                        self._trace_header_scalar(segy, header_map["inline"], first_trace),
+                        self._trace_header_scalar(segy, header_map["inline"], last_trace),
+                    ],
+                    dtype=np.int64,
+                )
+                xline_values = np.asarray(
+                    [
+                        self._trace_header_scalar(segy, header_map["xline"], first_trace),
+                        self._trace_header_scalar(segy, header_map["xline"], last_trace),
+                    ],
+                    dtype=np.int64,
+                )
+                first_inline = self._trace_header_scalar(segy, header_map["inline"], first_trace)
+                first_xline = self._trace_header_scalar(segy, header_map["xline"], first_trace)
+                second_xline = self._trace_header_scalar(segy, header_map["xline"], second_trace)
+                xline_step = abs(
+                    second_xline - first_xline
+                )
+
+                xline_min = int(np.min(xline_values))
+                xline_max = int(np.max(xline_values))
+                if xline_step > 0:
+                    num_cxline = int((xline_max - xline_min) / xline_step) + 1
+                else:
+                    num_cxline = 1
+
+                second_inline_first_trace = num_cxline if trace_count > num_cxline else first_trace
+                second_inline = self._trace_header_scalar(segy, header_map["inline"], second_inline_first_trace)
+                second_inline_xline = self._trace_header_scalar(segy, header_map["xline"], second_inline_first_trace)
+                inline_step = abs(second_inline - first_inline)
+
+                p0_trace = first_trace
+                p1_trace = min(max(num_cxline - 1, 0), last_trace)
+                p3_trace = max(trace_count - num_cxline, 0)
+
+                p0_x = self._trace_header_scalar(segy, header_map["x"], p0_trace)
+                p0_y = self._trace_header_scalar(segy, header_map["y"], p0_trace)
+                p1_x = self._trace_header_scalar(segy, header_map["x"], p1_trace)
+                p1_y = self._trace_header_scalar(segy, header_map["y"], p1_trace)
+                p3_x = self._trace_header_scalar(segy, header_map["x"], p3_trace)
+                p3_y = self._trace_header_scalar(segy, header_map["y"], p3_trace)
         except Exception as exc:
             self._append_info(f"scan failed: {exc}")
             return
@@ -240,14 +290,58 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
         self.end_inline_edit.setText(str(int(np.max(inline_values))))
         self.begin_xline_edit.setText(str(int(np.min(xline_values))))
         self.end_xline_edit.setText(str(int(np.max(xline_values))))
-        self.begin_sample_edit.setText(self._format_axis_value(float(np.min(sample_values))))
-        self.end_sample_edit.setText(self._format_axis_value(float(np.max(sample_values))))
+        self.step_xline_edit.setText(str(xline_step))
+        self.step_inline_edit.setText(str(inline_step))
+        sample_count = int(sample_values.size)
+        sample_spacing = abs(float(sample_values[1]) - float(sample_values[0])) if sample_count > 1 else 1.0
+        self.begin_sample_edit.setText("0")
+        self.end_sample_edit.setText(str(sample_count))
+        self.step_sample_edit.setText("1")
+        self.spacing_sample_edit.setText(self._format_axis_value(sample_spacing))
+        self.p0_x_edit.setText(str(p0_x))
+        self.p0_y_edit.setText(str(p0_y))
+        self.p1_x_edit.setText(str(p1_x))
+        self.p1_y_edit.setText(str(p1_y))
+        self.p3_x_edit.setText(str(p3_x))
+        self.p3_y_edit.setText(str(p3_y))
 
+        inline_min = int(np.min(inline_values))
+        inline_max = int(np.max(inline_values))
+        xline_min = int(np.min(xline_values))
+        xline_max = int(np.max(xline_values))
+
+        try:
+            survey_grid = SurveyGrid.from_three_points(
+                point0=GridControlPoint("Point0", (float(p0_x), float(p0_y),), float(inline_min), float(xline_min)),
+                point1=GridControlPoint("Point1", (float(p1_x), float(p1_y),), float(inline_min), float(xline_max)),
+                point3=GridControlPoint("Point3", (float(p3_x), float(p3_y),), float(inline_max), float(xline_min)),
+            )
+            self.spacing_inline_edit.setText(self._format_axis_value(float(survey_grid.spacing_inl)))
+            self.spacing_xline_edit.setText(self._format_axis_value(float(survey_grid.spacing_cxl)))
+        except Exception as exc:
+            self._append_info(f"survey grid spacing failed: {exc}")
+
+        self._append_info(
+            "scan debug: "
+            f"trace0 inline={first_inline} cxline={first_xline}; "
+            f"trace1 inline={first_inline} cxline={second_xline}; "
+            f"num_cxline={num_cxline}; "
+            f"trace{second_inline_first_trace} inline={second_inline} cxline={second_inline_xline}; "
+            f"p0_trace={p0_trace}; p1_trace={p1_trace}; p3_trace={p3_trace}; "
+            f"sample_count={sample_count}; sample_spacing={self.spacing_sample_edit.text()}; "
+            f"spacing_inl={self.spacing_inline_edit.text()}; spacing_cxl={self.spacing_xline_edit.text()}"
+        )
         self._append_info(
             "scan complete: "
             f"inline=({self.begin_inline_edit.text()}, {self.end_inline_edit.text()}) "
+            f"step={self.step_inline_edit.text()} "
             f"cxline=({self.begin_xline_edit.text()}, {self.end_xline_edit.text()}) "
-            f"sample=({self.begin_sample_edit.text()}, {self.end_sample_edit.text()})"
+            f"step={self.step_xline_edit.text()} "
+            f"sample=({self.begin_sample_edit.text()}, {self.end_sample_edit.text()}) "
+            f"step={self.step_sample_edit.text()} spacing={self.spacing_sample_edit.text()} "
+            f"p0=({self.p0_x_edit.text()}, {self.p0_y_edit.text()}) "
+            f"p1=({self.p1_x_edit.text()}, {self.p1_y_edit.text()}) "
+            f"p3=({self.p3_x_edit.text()}, {self.p3_y_edit.text()})"
         )
 
     def _on_file_type_changed(self, _index: int) -> None:
@@ -280,10 +374,30 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
             return su_module.open(str(path), "r", ignore_geometry=True)
         return segyio.open(str(path), "r", strict=False, ignore_geometry=True)
 
+    @staticmethod
+    def _trace_header_scalar(segy, field: int, trace_index: int) -> int:
+        values = np.asarray(segy.attributes(field)[trace_index]).reshape(-1)
+        if values.size == 0:
+            raise RuntimeError(f"missing header value for field={field} trace={trace_index}")
+        return int(values[0])
+
     def _update_form_label_width(self) -> None:
         metrics = self.fontMetrics()
         longest = max(metrics.horizontalAdvance(text) for text in self.FORM_LABEL_TEXTS)
         type(self).FORM_LABEL_WIDTH = longest + 8
+
+    def _on_ok_clicked(self) -> None:
+        values = self.values()
+        if values is None:
+            self._append_info("import failed: invalid input values")
+            return
+        self._append_info(
+            "import requested: "
+            f"path={values.get('path', '')} "
+            f"type={values.get('file_type', '')} "
+            f"output={values.get('name', '')}"
+        )
+        self.import_requested.emit(values)
 
     def __init__(
         self,
@@ -427,7 +541,7 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
         cancel_button = self._new_button("Cancel")
         ok_button = self._new_button("OK")
         cancel_button.clicked.connect(self.reject)
-        ok_button.clicked.connect(self.accept)
+        ok_button.clicked.connect(self._on_ok_clicked)
 
         output_as_row = QtWidgets.QWidget()
         output_as_layout = QtWidgets.QHBoxLayout(output_as_row)

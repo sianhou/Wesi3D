@@ -1,4 +1,5 @@
 numpy
+pytest
 PySide6
 segyio
 vtk

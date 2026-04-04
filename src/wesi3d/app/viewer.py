@@ -6067,12 +6067,8 @@ class SegyViewerWindow(QtWidgets.QMainWindow):
 
     def open_seismic_attribute_import_dialog(self, target_category: str = "seismic") -> None:
         dialog = SeismicAttributeImportDialog(self, target_category=target_category)
-        if dialog.exec() != int(QtWidgets.QDialog.DialogCode.Accepted):
-            return
-        values = dialog.values()
-        if values is None:
-            return
-        self.handle_seismic_attribute_import(values)
+        dialog.import_requested.connect(self.handle_seismic_attribute_import)
+        dialog.exec()
 
     def handle_seismic_attribute_import(self, values: dict[str, object]) -> None:
         print("[Viewer] handle_seismic_attribute_import", flush=True)
