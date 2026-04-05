@@ -160,13 +160,13 @@ def _build_binary_volume(
     path: Path,
     *,
     inlines: np.ndarray,
-    xlines: np.ndarray,
+    cxlines: np.ndarray,
     samples: np.ndarray,
 ) -> np.ndarray:
     num_inline = int(len(inlines))
-    num_xline = int(len(xlines))
+    num_cxline = int(len(cxlines))
     num_sample = int(len(samples))
-    expected_count = num_inline * num_xline * num_sample
+    expected_count = num_inline * num_cxline * num_sample
     expected_bytes = expected_count * np.dtype(np.float32).itemsize
     actual_bytes = path.stat().st_size
     if actual_bytes != expected_bytes:
@@ -176,9 +176,7 @@ def _build_binary_volume(
         )
 
     flat = np.fromfile(path, dtype=np.float32, count=expected_count)
-    # User-oriented layout is (inline, xline, sample). Internal VolumeData
-    # layout is (xline, inline, sample).
-    inline_major = flat.reshape((num_inline, num_xline, num_sample), order="C")
+    inline_major = flat.reshape((num_inline, num_cxline, num_sample), order="C")
     volume = np.transpose(inline_major, (1, 0, 2)).copy()
 
     return volume
@@ -191,7 +189,7 @@ def _build_segy_like_volume(
     name: str,
     metadata: dict[str, object],
     inlines: np.ndarray,
-    xlines: np.ndarray,
+    cxlines: np.ndarray,
     samples: np.ndarray,
     sample_indices: np.ndarray,
     inline_field: int,
@@ -201,15 +199,15 @@ def _build_segy_like_volume(
         raise ValueError("sample range is empty")
 
     num_inline = int(len(inlines))
-    num_xline = int(len(xlines))
+    num_cxline = int(len(cxlines))
     num_sample = int(len(samples))
     inline_begin = int(inlines[0])
-    xline_begin = int(xlines[0])
+    cxline_begin = int(cxlines[0])
     inline_step = int(inlines[1] - inlines[0]) if num_inline > 1 else 1
-    xline_step = int(xlines[1] - xlines[0]) if num_xline > 1 else 1
+    cxline_step = int(cxlines[1] - cxlines[0]) if num_cxline > 1 else 1
     sample_end_required = int(sample_indices[-1])
 
-    volume = np.zeros((num_xline, num_inline, num_sample), dtype=np.float32)
+    volume = np.zeros((num_cxline, num_inline, num_sample), dtype=np.float32)
     loaded_traces = 0
     skipped_out_of_range = 0
     skipped_step_mismatch = 0
@@ -227,19 +225,19 @@ def _build_segy_like_volume(
             if inline_value < int(inlines[0]) or inline_value > int(inlines[-1]):
                 skipped_out_of_range += 1
                 continue
-            if xline_value < int(xlines[0]) or xline_value > int(xlines[-1]):
+            if xline_value < int(cxlines[0]) or xline_value > int(cxlines[-1]):
                 skipped_out_of_range += 1
                 continue
 
             inline_offset = inline_value - inline_begin
-            xline_offset = xline_value - xline_begin
-            if inline_offset % inline_step != 0 or xline_offset % xline_step != 0:
+            cxline_offset = xline_value - cxline_begin
+            if inline_offset % inline_step != 0 or cxline_offset % cxline_step != 0:
                 skipped_step_mismatch += 1
                 continue
 
             inline_index = inline_offset // inline_step
-            xline_index = xline_offset // xline_step
-            if not (0 <= inline_index < num_inline and 0 <= xline_index < num_xline):
+            cxline_index = cxline_offset // cxline_step
+            if not (0 <= inline_index < num_inline and 0 <= cxline_index < num_cxline):
                 skipped_out_of_range += 1
                 continue
 
@@ -253,7 +251,7 @@ def _build_segy_like_volume(
                 skipped_sample_mismatch += 1
                 continue
 
-            volume[xline_index, inline_index, :] = selected_trace
+            volume[cxline_index, inline_index, :] = selected_trace
             loaded_traces += 1
 
     print("[SeismicAttributeImporterService] trace stats", flush=True)
@@ -303,7 +301,7 @@ def execute_import(values: dict[str, object]) -> dict[str, object]:
     sample_step = _as_int(values, "step_sample")
 
     inlines = _inclusive_axis(inline_begin, inline_end, inline_step)
-    xlines = _inclusive_axis(xline_begin, xline_end, xline_step)
+    cxlines = _inclusive_axis(xline_begin, xline_end, xline_step)
     sample_indices = _sample_indices(sample_begin, sample_end, sample_step)
     if sample_indices.size == 0:
         raise ValueError("Sample range is empty")
@@ -315,7 +313,7 @@ def execute_import(values: dict[str, object]) -> dict[str, object]:
     print(f"[SeismicAttributeImporterService] output_path={output_path}", flush=True)
     print(
         "[SeismicAttributeImporterService] shape="
-        f"({len(inlines)}, {len(xlines)}, {len(samples)})",
+        f"({len(inlines)}, {len(cxlines)}, {len(samples)})",
         flush=True,
     )
 
@@ -330,7 +328,7 @@ def execute_import(values: dict[str, object]) -> dict[str, object]:
         volume = _build_binary_volume(
             path,
             inlines=inlines,
-            xlines=xlines,
+            cxlines=cxlines,
             samples=samples,
         )
     elif file_type in {"segy", "su"}:
@@ -338,10 +336,10 @@ def execute_import(values: dict[str, object]) -> dict[str, object]:
             path,
             file_type=file_type,
             name=name,
-            metadata=metadata,
-            inlines=inlines,
-            xlines=xlines,
-            samples=samples,
+                metadata=metadata,
+                inlines=inlines,
+                cxlines=cxlines,
+                samples=samples,
             sample_indices=sample_indices,
             inline_field=_as_int(values, "inline_field"),
             xline_field=_as_int(values, "xline_field"),
