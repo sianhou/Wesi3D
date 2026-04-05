@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-NPZ-oriented volume container.
+Package-oriented volume data model.
 
-VolumeData2 is a lightweight storage layer that matches the importer output
-format exactly:
+VolumePackage mirrors the current on-disk npz structure:
     - type
     - range
     - grid
@@ -12,9 +11,7 @@ format exactly:
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 
@@ -24,14 +21,14 @@ class AxisRange:
     begin: int
     end: int
     step: int
-    spacing: int
+    spacing: float
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, object]:
         return {
             "begin": int(self.begin),
             "end": int(self.end),
             "step": int(self.step),
-            "spacing": int(self.spacing),
+            "spacing": float(self.spacing),
         }
 
     @classmethod
@@ -40,7 +37,7 @@ class AxisRange:
             begin=int(values["begin"]),
             end=int(values["end"]),
             step=int(values["step"]),
-            spacing=int(values["spacing"]),
+            spacing=float(values["spacing"]),
         )
 
 
@@ -108,7 +105,7 @@ class GridMeta:
 
 
 @dataclass(frozen=True)
-class VolumeData2:
+class VolumePackage:
     type: str
     range: RangeMeta
     grid: GridMeta
@@ -116,48 +113,13 @@ class VolumeData2:
 
     def __post_init__(self) -> None:
         if str(self.type) != "volume":
-            raise ValueError("VolumeData2.type must be 'volume'")
+            raise ValueError("VolumePackage.type must be 'volume'")
         array = np.asarray(self.data, dtype=np.float32)
         if array.ndim != 3:
-            raise ValueError("VolumeData2.data must be 3D")
+            raise ValueError("VolumePackage.data must be 3D")
         object.__setattr__(self, "type", "volume")
         object.__setattr__(self, "data", array)
 
     @property
     def shape(self) -> tuple[int, int, int]:
         return tuple(int(v) for v in self.data.shape)
-
-    def to_npz(self, path: str | Path) -> Path:
-        output_path = Path(path).expanduser()
-        if output_path.suffix.lower() != ".npz":
-            output_path = output_path.with_suffix(".npz")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            output_path,
-            type=np.asarray(json.dumps(self.type)),
-            range=np.asarray(json.dumps(self.range.as_dict())),
-            grid=np.asarray(json.dumps(self.grid.as_dict())),
-            data=np.asarray(self.data, dtype=np.float32),
-        )
-        return output_path
-
-    @classmethod
-    def from_npz(cls, path: str | Path) -> "VolumeData2":
-        npz_path = Path(path).expanduser().resolve()
-        with np.load(npz_path, allow_pickle=False) as archive:
-            type_name = json.loads(_payload_text(archive["type"]))
-            range_meta = RangeMeta.from_dict(json.loads(_payload_text(archive["range"])))
-            grid_meta = GridMeta.from_dict(json.loads(_payload_text(archive["grid"])))
-            data = np.asarray(archive["data"], dtype=np.float32)
-        return cls(
-            type=str(type_name),
-            range=range_meta,
-            grid=grid_meta,
-            data=data,
-        )
-
-
-def _payload_text(value: object) -> str:
-    if isinstance(value, np.ndarray) and value.shape == ():
-        return str(value.item())
-    return str(value)

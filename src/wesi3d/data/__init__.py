@@ -2,12 +2,15 @@
 Data access and render-ready data structures.
 """
 
-from .volume_data2 import AxisRange, GridMeta, GridPoint, RangeMeta, VolumeData2
+from .volume_package import AxisRange, GridMeta, GridPoint, RangeMeta, VolumePackage
+from .volume_store import NpzVolumeStore, ZarrVolumeStore
 
 __all__ = [
     "AxisRange",
     "GridMeta",
     "GridPoint",
     "RangeMeta",
-    "VolumeData2",
+    "VolumePackage",
+    "NpzVolumeStore",
+    "ZarrVolumeStore",
 ]

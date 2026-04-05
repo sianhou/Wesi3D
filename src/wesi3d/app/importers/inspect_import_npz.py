@@ -11,11 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-
-def _payload_scalar(value: object) -> object:
-    if isinstance(value, np.ndarray) and value.shape == ():
-        return value.item()
-    return value
+from wesi3d.data.volume_store import NpzVolumeStore
 
 
 def inspect_npz(path: str | Path) -> int:
@@ -24,11 +20,11 @@ def inspect_npz(path: str | Path) -> int:
         print(f"NPZ file not found: {npz_path}", flush=True)
         return 1
 
-    with np.load(npz_path, allow_pickle=False) as archive:
-        data_type = json.loads(str(_payload_scalar(archive["type"])))
-        range_info = json.loads(str(_payload_scalar(archive["range"])))
-        grid = json.loads(str(_payload_scalar(archive["grid"])))
-        data = np.asarray(archive["data"], dtype=np.float32)
+    package = NpzVolumeStore.load(npz_path)
+    data_type = package.type
+    range_info = package.range.as_dict()
+    grid = package.grid.as_dict()
+    data = np.asarray(package.data, dtype=np.float32)
 
     print(f"path={npz_path}", flush=True)
     print(f"type={json.dumps(data_type, ensure_ascii=False, indent=2)}", flush=True)

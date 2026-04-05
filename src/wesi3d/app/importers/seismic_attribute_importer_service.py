@@ -12,7 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
-from ...data.volume_data2 import AxisRange, GridMeta, GridPoint, RangeMeta, VolumeData2
+from ...data.volume_package import AxisRange, GridMeta, GridPoint, RangeMeta, VolumePackage
+from ...data.volume_store import NpzVolumeStore
 
 try:
     import segyio
@@ -32,6 +33,10 @@ def _as_int(values: dict[str, object], key: str) -> int:
 def _as_str(values: dict[str, object], key: str, default: str = "") -> str:
     text = str(values.get(key, default)).strip()
     return text or default
+
+
+def _as_float(values: dict[str, object], key: str) -> float:
+    return float(str(values.get(key, "")).strip())
 
 
 def _inclusive_axis(begin: int, end: int, step: int) -> np.ndarray:
@@ -77,15 +82,15 @@ def _import_metadata(
         "begin_inline": _as_int(values, "begin_inline"),
         "end_inline": _as_int(values, "end_inline"),
         "step_inline": _as_int(values, "step_inline"),
-        "spacing_inline": _as_int(values, "spacing_inline"),
+        "spacing_inline": _as_float(values, "spacing_inline"),
         "begin_xline": _as_int(values, "begin_xline"),
         "end_xline": _as_int(values, "end_xline"),
         "step_xline": _as_int(values, "step_xline"),
-        "spacing_xline": _as_int(values, "spacing_xline"),
+        "spacing_xline": _as_float(values, "spacing_xline"),
         "begin_sample": _as_int(values, "begin_sample"),
         "end_sample": _as_int(values, "end_sample"),
         "step_sample": _as_int(values, "step_sample"),
-        "spacing_sample": _as_int(values, "spacing_sample"),
+        "spacing_sample": _as_float(values, "spacing_sample"),
         "p0_x": float(values.get("p0_x", 0.0)),
         "p0_y": float(values.get("p0_y", 0.0)),
         "p1_x": float(values.get("p1_x", 0.0)),
@@ -95,32 +100,32 @@ def _import_metadata(
     }
 
 
-def _build_volume_data2(
+def _build_volume_package(
     *,
     data: np.ndarray,
     name: str,
     metadata: dict[str, object],
-) -> VolumeData2:
-    return VolumeData2(
+) -> VolumePackage:
+    return VolumePackage(
         type="volume",
         range=RangeMeta(
             inline=AxisRange(
                 begin=int(metadata["begin_inline"]),
                 end=int(metadata["end_inline"]),
                 step=int(metadata["step_inline"]),
-                spacing=int(metadata["spacing_inline"]),
+                spacing=float(metadata["spacing_inline"]),
             ),
             cxline=AxisRange(
                 begin=int(metadata["begin_xline"]),
                 end=int(metadata["end_xline"]),
                 step=int(metadata["step_xline"]),
-                spacing=int(metadata["spacing_xline"]),
+                spacing=float(metadata["spacing_xline"]),
             ),
             sample=AxisRange(
                 begin=int(metadata["begin_sample"]),
                 end=int(metadata["end_sample"]),
                 step=int(metadata["step_sample"]),
-                spacing=int(metadata["spacing_sample"]),
+                spacing=float(metadata["spacing_sample"]),
             ),
         ),
         grid=GridMeta(
@@ -154,8 +159,6 @@ def _open_trace_file(path: Path, file_type: str):
 def _build_binary_volume(
     path: Path,
     *,
-    name: str,
-    metadata: dict[str, object],
     inlines: np.ndarray,
     xlines: np.ndarray,
     samples: np.ndarray,
@@ -326,8 +329,6 @@ def execute_import(values: dict[str, object]) -> dict[str, object]:
     if file_type == "binary":
         volume = _build_binary_volume(
             path,
-            name=name,
-            metadata=metadata,
             inlines=inlines,
             xlines=xlines,
             samples=samples,
@@ -348,12 +349,12 @@ def execute_import(values: dict[str, object]) -> dict[str, object]:
     else:
         raise ValueError(f"Unsupported file type: {file_type}")
 
-    volume_data2 = _build_volume_data2(
+    volume_package = _build_volume_package(
         data=volume,
         name=name,
         metadata=metadata,
     )
-    volume_data2.to_npz(output_path)
+    NpzVolumeStore.save(volume_package, output_path)
     return {
         "output_path": str(output_path),
         "name": name,
