@@ -604,7 +604,8 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
     def _browse_path(self) -> None:
         dialog = QtWidgets.QFileDialog(self, "Select Input File", "", "SEG-Y Files (*.sgy *.segy *.su);;All Files (*)")
         dialog.setOption(QtWidgets.QFileDialog.Option.DontUseNativeDialog, True)
-        dialog.setFileMode(QtWidgets.QFileDialog.FileMode.ExistingFile)
+        dialog.setFileMode(QtWidgets.QFileDialog.FileMode.AnyFile)
+        dialog.setAcceptMode(QtWidgets.QFileDialog.AcceptMode.AcceptOpen)
         if dialog.exec():
             files = dialog.selectedFiles()
             if files:
@@ -614,7 +615,9 @@ class SeismicAttributeImportDialog(QtWidgets.QDialog):
         start_path = self.output_name_edit.text().strip() or self.path_edit.text().strip()
         dialog = QtWidgets.QFileDialog(self, "Select Output File", start_path, "All Files (*)")
         dialog.setOption(QtWidgets.QFileDialog.Option.DontUseNativeDialog, True)
-        dialog.setFileMode(QtWidgets.QFileDialog.FileMode.ExistingFile)
+        dialog.setFileMode(QtWidgets.QFileDialog.FileMode.AnyFile)
+        dialog.setAcceptMode(QtWidgets.QFileDialog.AcceptMode.AcceptSave)
+        dialog.setDefaultSuffix("npz")
         if dialog.exec():
             files = dialog.selectedFiles()
             if files:

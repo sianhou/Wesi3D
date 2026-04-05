@@ -29,7 +29,7 @@ class NpzVolumeStore:
         if output_path.suffix.lower() != ".npz":
             output_path = output_path.with_suffix(".npz")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
+        np.savez(
             output_path,
             type=np.asarray(json.dumps(package.type)),
             range=np.asarray(json.dumps(package.range.as_dict())),
