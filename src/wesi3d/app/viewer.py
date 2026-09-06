@@ -4884,6 +4884,32 @@ class SliceUpdater:
         self.scalar_bar_actor.Modified()
 
 
+class ViewerRenderWidget(QVTKRenderWindowInteractor):
+    """Avoid the Cocoa/Qt 6.10+ paint/render feedback loop."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._paint_requested = True
+        super().__init__(*args, **kwargs)
+
+    def update(self, *args) -> None:
+        self._paint_requested = True
+        super().update(*args)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        self._paint_requested = True
+        super().showEvent(event)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        if sys.platform == "darwin":
+            # Render() itself generates Cocoa paint events. Only consume a
+            # requested update (including QVTK's resize updates), or Qt can
+            # continuously repaint and starve timers and user input.
+            if not self._paint_requested:
+                return
+            self._paint_requested = False
+        super().paintEvent(event)
+
+
 class SegyViewerWindow(QtWidgets.QMainWindow):
     def __init__(
         self,
@@ -7654,7 +7680,7 @@ def launch_vtk_viewer(
     for actor in axis_texts:
         renderer.AddActor(actor)
     scalar_bar_actor = create_scalar_bar_actor()
-    renderer.AddActor2D(scalar_bar_actor)
+    renderer.AddViewProp(scalar_bar_actor)
 
     overlay = vtk.vtkTextActor()
     overlay.GetTextProperty().SetFontSize(20)
@@ -7662,7 +7688,7 @@ def launch_vtk_viewer(
     overlay.SetDisplayPosition(20, 20)
     renderer.AddViewProp(overlay)
 
-    vtk_widget = QVTKRenderWindowInteractor()
+    vtk_widget = ViewerRenderWidget()
     render_window = vtk_widget.GetRenderWindow()
     render_window.SetWindowName(f"SEG-Y Slice Viewer - {segy_path.name if segy_path is not None else 'Empty'}")
     render_window.AddRenderer(renderer)
